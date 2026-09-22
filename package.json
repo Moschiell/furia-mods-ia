@@ -1,10 +1,11 @@
 {
   "name": "furia-mods-ia",
-  "version": "5.5.0",
+  "version": "5.6.0",
   "description": "Painel de automação do Fúria Mods",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright install chromium"
   },
   "engines": {
     "node": "22.x"

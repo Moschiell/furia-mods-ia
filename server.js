@@ -136,6 +136,10 @@ function extractMediaFireCandidates(html,baseUrl){
   const directRe=/https?:\/\/download\d*\.mediafire\.com\/[^\s"'<>]+/gi;
   while((m=directRe.exec(html))) add(m[0].replace(/\\/g,""));
 
+  // Alguns clientes do MediaFire/JDownloader encontram o link em kNO.
+  const knoRe=/\bkNO\s*=\s*["'](https?:\/\/download\d*\.mediafire\.com\/[^"']+)["']/gi;
+  while((m=knoRe.exec(html))) add(m[1].replace(/\\/g,""));
+
   const buttonRe=/<a\b[^>]*id=["']downloadButton["'][^>]*>/gi;
   while((m=buttonRe.exec(html))){
     const tag=m[0];
@@ -280,7 +284,10 @@ async function resolveMediaFire(url){
   const finalUrl=r.url;
   const ct=r.headers.get("content-type")||"";
   const cd=r.headers.get("content-disposition")||"";
-  const directType=archiveType(cd,ct,finalUrl);
+  // IMPORTANTE: a própria URL da página do MediaFire contém ".zip", mas isso
+  // não significa que a resposta seja um ZIP. Nunca usamos a URL da página
+  // para declarar que o conteúdo já é um arquivo.
+  const directType=archiveType(cd,ct);
   if(directType) return {downloadUrl:finalUrl,filename:dispositionName(cd),type:directType};
 
   const html=await r.text();
@@ -309,33 +316,69 @@ async function resolveMediaFire(url){
 
 async function resolveWithBrowser(url){
   if(!chromium) throw new Error("O navegador automático não está disponível no servidor.");
-  const browser=await chromium.launch({headless:true});
+  const executablePath = process.env.CHROMIUM_PATH || (fs.existsSync("/usr/bin/chromium") ? "/usr/bin/chromium" : undefined);
+  const browser=await chromium.launch({
+    headless:true,
+    executablePath,
+    args:["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
+  });
   let context=null, page=null;
   try{
     context=await browser.newContext({acceptDownloads:true,userAgent:"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"});
     page=await context.newPage();
+    let downloadResolve;
     const downloadPromise=new Promise(resolve=>{
+      downloadResolve=resolve;
       page.once("download", d=>resolve(d));
-      setTimeout(()=>resolve(null),30000);
+      setTimeout(()=>resolve(null),45000);
     });
-    await page.goto(url,{waitUntil:"domcontentloaded",timeout:30000});
+    let navigationDownload=false;
+    try {
+      await page.goto(url,{waitUntil:"domcontentloaded",timeout:30000});
+    } catch (e) {
+      // Playwright pode lançar quando a navegação inicia um download diretamente.
+      if (/download|net::ERR_ABORTED/i.test(String(e?.message||e))) navigationDownload=true;
+      else throw e;
+    }
     const host=new URL(url).hostname.toLowerCase();
 
-    // MediaFire pode apresentar uma tela de confirmação de segurança antes do download.
+    // Aguarda o elemento real do MediaFire aparecer. Ele pode ser inserido
+    // depois do carregamento inicial da página.
     if(host.includes("mediafire.com")){
+      await page.locator('#downloadButton').first().waitFor({state:'visible',timeout:15000}).catch(()=>{});
       const checkbox=page.locator('input[type="checkbox"]').first();
       if(await checkbox.count() && await checkbox.isVisible().catch(()=>false)) await checkbox.check().catch(()=>{});
-      for(const selector of [
+      const selectors=[
         'button:has-text("Download Anyway")',
         'a:has-text("Download Anyway")',
         'button:has-text("Baixar mesmo assim")',
         'a:has-text("Baixar mesmo assim")',
-        '#downloadButton'
-      ]){
+        '#downloadButton',
+        'a[id="downloadButton"]',
+        'a[aria-label="Download file"]'
+      ];
+      let clicked=false;
+      for(const selector of selectors){
         const el=page.locator(selector).first();
         if(await el.count() && await el.isVisible().catch(()=>false)){
-          await el.click().catch(()=>{});
-          break;
+          try {
+            await el.scrollIntoViewIfNeeded();
+            await el.click({timeout:10000});
+            clicked=true;
+            break;
+          } catch {}
+        }
+      }
+      if(!clicked){
+        // Último fallback: procurar qualquer link/botão cujo texto indique download.
+        const candidates=page.locator('a,button,input[type="button"],input[type="submit"]');
+        const count=await candidates.count();
+        for(let i=0;i<Math.min(count,80);i++){
+          const el=candidates.nth(i);
+          const text=((await el.innerText().catch(()=>''))+' '+(await el.getAttribute('value').catch(()=>''))).trim().toLowerCase();
+          if(text.includes('download') || text.includes('baixar')){
+            try { await el.click({timeout:5000}); clicked=true; break; } catch {}
+          }
         }
       }
     }
@@ -369,6 +412,23 @@ async function resolveWithBrowser(url){
     }
 
     const dl=await downloadPromise;
+    if(!dl && navigationDownload){
+      // Navegação direta pode ter disparado o download antes do listener conseguir
+      // materializá-lo. Recarregamos em uma nova aba e aguardamos explicitamente.
+      const p2=await context.newPage();
+      try{
+        const d2=p2.waitForEvent('download',{timeout:20000}).catch(()=>null);
+        await p2.goto(url,{waitUntil:'domcontentloaded',timeout:20000}).catch(()=>{});
+        const got=await d2;
+        if(got){
+          const target=path.join(os.tmpdir(),`furia-browser-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
+          await got.saveAs(target);
+          const magic=await detectArchiveTypeByMagicBytes(target);
+          if(!magic){ try{await fsp.rm(target,{force:true})}catch{}; throw new Error("O navegador recebeu conteúdo que não é ZIP, RAR ou 7Z."); }
+          return {localPath:target,filename:got.suggestedFilename(),type:magic};
+        }
+      } finally { await p2.close().catch(()=>{}); }
+    }
     if(!dl) throw new Error("O navegador abriu a página, mas não recebeu um download do arquivo.");
     const target=path.join(os.tmpdir(),`furia-browser-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
     await dl.saveAs(target);
