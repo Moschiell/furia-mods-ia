@@ -24,8 +24,8 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"4.0.1",
-  archiveDetection:["zip","rar","7z"]
+  ok:true, project:"furia-mods-ia", version:"5.0.0",
+  archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
 function dispositionName(v){
@@ -42,10 +42,51 @@ function archiveType(name="",ct="",url=""){
   return null;
 }
 
+// ===== Assinaturas de arquivo (magic bytes) =====
+// Não confiamos apenas na extensão/Content-Type do MediaFire: conferimos os
+// primeiros bytes do arquivo baixado antes de mandar pro 7-Zip.
+const MAGIC_SIGNATURES = [
+  {type:"ZIP", bytes:[0x50,0x4B,0x03,0x04]},
+  {type:"ZIP", bytes:[0x50,0x4B,0x05,0x06]}, // zip vazio
+  {type:"ZIP", bytes:[0x50,0x4B,0x07,0x08]}, // zip com spanning
+  {type:"RAR", bytes:[0x52,0x61,0x72,0x21,0x1A,0x07]},
+  {type:"7Z",  bytes:[0x37,0x7A,0xBC,0xAF,0x27,0x1C]}
+];
+async function detectArchiveTypeByMagicBytes(filePath){
+  const fd=await fsp.open(filePath,"r");
+  try{
+    const buf=Buffer.alloc(8);
+    await fd.read(buf,0,8,0);
+    for(const sig of MAGIC_SIGNATURES){
+      if(buf.slice(0,sig.bytes.length).equals(Buffer.from(sig.bytes))) return sig.type;
+    }
+    return null;
+  } finally { await fd.close(); }
+}
+async function readHeadAsText(filePath,maxBytes=800){
+  const fd=await fsp.open(filePath,"r");
+  try{
+    const buf=Buffer.alloc(maxBytes);
+    const {bytesRead}=await fd.read(buf,0,maxBytes,0);
+    return buf.slice(0,bytesRead).toString("utf8");
+  } finally { await fd.close(); }
+}
+
 async function fetchPage(url){
   const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"}});
   if(!r.ok) throw new Error(`Não foi possível acessar o link (HTTP ${r.status}).`);
   return r;
+}
+
+// Extrai especificamente o href do botão de download do MediaFire
+// (<a id="downloadButton" href="...">), que é onde o link real do arquivo fica.
+function extractDownloadButtonHref(html){
+  const tagMatch =
+    html.match(/<a\b[^>]*id=["']downloadButton["'][^>]*>/i) ||
+    html.match(/<a\b[^>]*href=["'][^"']+["'][^>]*id=["']downloadButton["'][^>]*>/i);
+  if(!tagMatch) return null;
+  const hrefMatch=tagMatch[0].match(/href=["']([^"']+)["']/i);
+  return hrefMatch ? hrefMatch[1] : null;
 }
 
 async function resolveMediaFire(url){
@@ -57,6 +98,17 @@ async function resolveMediaFire(url){
   if(directType) return {downloadUrl:finalUrl,filename:dispositionName(cd),type:directType};
 
   const html=await r.text();
+
+  // 1) Estratégia principal: o botão oficial de download do MediaFire.
+  const buttonHref=extractDownloadButtonHref(html);
+  if(buttonHref){
+    try{
+      const absolute=new URL(buttonHref,finalUrl).toString();
+      return {downloadUrl:absolute,filename:dispositionName(cd)||null,type:archiveType(absolute,"",absolute)};
+    }catch{}
+  }
+
+  // 2) Fallback: varredura genérica de links candidatos (páginas antigas/variações de layout).
   const candidates=[];
   const add=(u)=>{
     try{
@@ -64,8 +116,6 @@ async function resolveMediaFire(url){
       if(!candidates.includes(a)) candidates.push(a);
     }catch{}
   };
-
-  // Common MediaFire download attributes plus URLs embedded in page scripts.
   for(const re of [
     /href=["']([^"']+)["'][^>]*(?:download|download_link|downloadButton)[^>]*>/gi,
     /(?:downloadLink|download_url|downloadUrl|directDownload|downloadUrlText)\s*[:=]\s*["']([^"']+)["']/gi,
@@ -177,16 +227,26 @@ app.post("/api/analyze",async(req,res)=>{
     const resolved=await resolveDownload(source);
     archive=path.join(os.tmpdir(),`furia-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
     const dl=await downloadFile(resolved.downloadUrl,archive);
+
+    // ===== Validação por magic bytes (obrigatória antes de extrair) =====
+    // Não confiamos na extensão/Content-Type: conferimos a assinatura real do
+    // arquivo baixado. Se não bater com ZIP/RAR/7Z, avisamos claramente em vez
+    // de deixar o 7-Zip falhar com um erro confuso.
+    const magicType=await detectArchiveTypeByMagicBytes(archive);
+    if(!magicType){
+      const head=await readHeadAsText(archive,800);
+      const looksHtml=/<html|<!doctype html/i.test(head);
+      throw new Error(looksHtml
+        ? "O MediaFire retornou uma página HTML em vez do arquivo real (provavelmente uma página intermediária ou de verificação). O download automático não encontrou o link direto do arquivo — tente novamente em alguns instantes ou confirme se o mod ainda está disponível no MediaFire."
+        : "O arquivo baixado não corresponde a um ZIP, RAR ou 7Z válido (assinatura de arquivo não reconhecida).");
+    }
+    const type=magicType;
+
     out=path.join(os.tmpdir(),`furia-out-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     await fsp.mkdir(out);
-    let type=resolved.type;
-    // If the host omitted the extension/type, 7-Zip itself will identify the format.
     const analysis=await analyzeArchive(archive,out);
-    if(type==="DESCONHECIDO"){
-      const n=resolved.filename||"";
-      type=archiveType(n,"",resolved.downloadUrl)||"ARQUIVO";
-    }
-    res.json({ok:true,version:"4.0.1",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+
+    res.json({ok:true,version:"5.0.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -199,4 +259,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V4.0 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V5.0 rodando na porta ${PORT}`));
