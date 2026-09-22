@@ -24,7 +24,7 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.1.0",
+  ok:true, project:"furia-mods-ia", version:"5.2.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -80,26 +80,104 @@ async function fetchPage(url){
 
 // Extrai especificamente o href do botão de download do MediaFire
 // (<a id="downloadButton" href="...">), que é onde o link real do arquivo fica.
-function extractDownloadButtonHref(html){
-  const tagMatch =
-    html.match(/<a\b[^>]*id=["']downloadButton["'][^>]*>/i) ||
-    html.match(/<a\b[^>]*href=["'][^"']+["'][^>]*id=["']downloadButton["'][^>]*>/i);
-  if(!tagMatch) return null;
-  const hrefMatch=tagMatch[0].match(/href=["']([^"']+)["']/i);
-  return hrefMatch ? hrefMatch[1] : null;
+function decodeHtmlEntities(v=""){
+  return v
+    .replace(/&amp;/gi,"&")
+    .replace(/&quot;/gi,'"')
+    .replace(/&#39;/gi,"'")
+    .replace(/&#x2F;/gi,"/")
+    .replace(/&#47;/gi,"/");
+}
+function normalizeCandidateUrl(v,base){
+  if(!v) return null;
+  let value=decodeHtmlEntities(String(v).trim());
+  if(!value) return null;
+  // Alguns atributos vêm URL-encoded ou começam com //.
+  try{ value=decodeURIComponent(value); }catch{}
+  try{return new URL(value,base).toString();}catch{return null;}
+}
+
+// MediaFire já usou mais de uma forma para esconder/expor o link real.
+// Atualmente podemos encontrar o endereço no href do downloadButton ou no
+// data-scrambled-url (Base64). Não dependemos de um único formato.
+function decodeScrambledUrl(value){
+  if(!value) return null;
+  let v=decodeHtmlEntities(String(value).trim());
+  try{v=decodeURIComponent(v)}catch{}
+  if(/^https?:\/\//i.test(v) || /^\/\//.test(v)) return v;
+  try{
+    const decoded=Buffer.from(v,"base64").toString("utf8").trim();
+    if(/^https?:\/\//i.test(decoded) || /^\/\//.test(decoded)) return decoded;
+  }catch{}
+  return null;
+}
+function extractMediaFireCandidates(html,baseUrl){
+  const out=[];
+  const add=(v)=>{
+    const u=normalizeCandidateUrl(v,baseUrl);
+    if(u && !out.includes(u)) out.push(u);
+  };
+
+  // 1) Botão oficial: href + data-scrambled-url.
+  const buttonRe=/<a\b[^>]*id=["']downloadButton["'][^>]*>/gi;
+  let m;
+  while((m=buttonRe.exec(html))){
+    const tag=m[0];
+    const href=tag.match(/\bhref=["']([^"']+)["']/i);
+    const scrambled=tag.match(/\bdata-scrambled-url=["']([^"']+)["']/i);
+    const dataUrl=tag.match(/\b(?:data-url|data-href)=["']([^"']+)["']/i);
+    if(scrambled) add(decodeScrambledUrl(scrambled[1]));
+    if(dataUrl) add(dataUrl[1]);
+    if(href) add(href[1]);
+  }
+
+  // 2) Caso o atributo id venha depois do href.
+  const buttonAlt=/<a\b[^>]*href=["']([^"']+)["'][^>]*id=["']downloadButton["'][^>]*>/gi;
+  while((m=buttonAlt.exec(html))) add(m[1]);
+
+  // 3) Outras variantes encontradas em versões diferentes da página.
+  for(const re of [
+    /\bdata-scrambled-url=["']([^"']+)["']/gi,
+    /\b(?:downloadLink|download_url|downloadUrl|directDownload|downloadUrlText)\s*[:=]\s*["']([^"']+)["']/gi,
+    /\bhref=["']([^"']+)["'][^>]*(?:download|download_link)[^>]*>/gi,
+    /\bhttps?:\/\/download\d+\.mediafire\.com\/[^"'\\<>\s]+/gi
+  ]){
+    while((m=re.exec(html))){
+      const raw=m[1]||m[0];
+      const decoded=decodeScrambledUrl(raw);
+      add(decoded||raw);
+    }
+  }
+  return out;
 }
 
 async function probeArchiveCandidate(url){
   try{
-    const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36","Range":"bytes=0-8191"}});
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),12000);
+    const r=await fetch(url,{redirect:"follow",signal:controller.signal,headers:{
+      "User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+      "Range":"bytes=0-8191"
+    }});
+    clearTimeout(timer);
     if(!r.ok) return null;
     const finalUrl=r.url;
     const ct=r.headers.get("content-type")||"";
     const cd=r.headers.get("content-disposition")||"";
     const name=dispositionName(cd);
-    const buf=Buffer.from(await r.arrayBuffer());
+
+    // Lemos somente o primeiro chunk. Assim um teste de candidato nunca
+    // baixa um ZIP/RAR/7Z inteiro para a memória do Render.
+    const reader=r.body?.getReader();
+    let buf=Buffer.alloc(0);
+    if(reader){
+      const first=await reader.read();
+      if(first.value) buf=Buffer.from(first.value);
+      try{await reader.cancel()}catch{}
+    }
     const magic=findMagicType(buf);
     const type=magic||archiveType(name,ct,finalUrl);
+    if(!type) return null;
     return {downloadUrl:finalUrl,filename:name,type,magic};
   }catch{return null}
 }
@@ -119,42 +197,20 @@ async function resolveMediaFire(url){
   if(directType) return {downloadUrl:finalUrl,filename:dispositionName(cd),type:directType};
 
   const html=await r.text();
-  const candidates=[];
-  const add=(u)=>{
-    try{
-      const a=new URL(u,finalUrl).toString();
-      if(!candidates.includes(a)) candidates.push(a);
-    }catch{}
-  };
+  const candidates=extractMediaFireCandidates(html,finalUrl);
 
-  // Primeiro tentamos o botão oficial do MediaFire.
-  const buttonHref=extractDownloadButtonHref(html);
-  if(buttonHref) add(buttonHref);
+  console.log(`MediaFire: ${candidates.length} candidato(s) encontrado(s).`);
 
-  // Depois procuramos outras formas usadas pelas diferentes versões do MediaFire.
-  for(const re of [
-    /href=["']([^"']+)["'][^>]*(?:download|download_link|downloadButton)[^>]*>/gi,
-    /(?:downloadLink|download_url|downloadUrl|directDownload|downloadUrlText)\s*[:=]\s*["']([^"']+)["']/gi,
-    /https?:\/\/[^"'\\\s<>]+/gi
-  ]){
-    let m;
-    while((m=re.exec(html))) add(m[1]||m[0]);
-  }
-
-  const ordered=candidates.sort((a,b)=>
-    (/download/i.test(b)?1:0)-(/download/i.test(a)?1:0)
-  );
-
-  // O ponto importante: não aceitamos simplesmente o primeiro href.
-  // Testamos os bytes iniciais para confirmar que é realmente ZIP/RAR/7Z.
-  for(const candidate of ordered){
+  // Primeiro os links do botão oficial; depois qualquer candidato direto.
+  for(const candidate of candidates){
     const probe=await probeArchiveCandidate(candidate);
     if(probe && probe.magic){
+      console.log(`MediaFire: arquivo real encontrado em ${probe.downloadUrl}`);
       return {downloadUrl:probe.downloadUrl,filename:probe.filename||null,type:probe.magic};
     }
   }
 
-  throw new Error("O MediaFire foi acessado, mas não foi possível localizar automaticamente o arquivo ZIP, RAR ou 7Z. O servidor não encontrou um download real nos links expostos pela página.");
+  throw new Error("O MediaFire foi acessado, mas o link direto do arquivo não foi resolvido automaticamente. O servidor encontrou a página, porém precisa localizar o endereço real do botão de download.");
 }
 async function resolveDownload(url){
   const u=new URL(url);
@@ -354,7 +410,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.1.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"5.2.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -367,4 +423,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V5.1 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V5.2 rodando na porta ${PORT}`));
