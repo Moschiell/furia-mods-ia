@@ -103,10 +103,15 @@ function normalizeCandidateUrl(v,base){
 function decodeScrambledUrl(value){
   if(!value) return null;
   let v=decodeHtmlEntities(String(value).trim());
-  try{v=decodeURIComponent(v)}catch{}
+  v=v.replace(/\s+/g,"");
+  for(let i=0;i<2;i++){
+    try{v=decodeURIComponent(v)}catch{}
+  }
   if(/^https?:\/\//i.test(v) || /^\/\//.test(v)) return v;
   try{
-    const decoded=Buffer.from(v,"base64").toString("utf8").trim();
+    const normalized=v.replace(/-/g,"+").replace(/_/g,"/");
+    const padded=normalized + "=".repeat((4-normalized.length%4)%4);
+    const decoded=Buffer.from(padded,"base64").toString("utf8").trim();
     if(/^https?:\/\//i.test(decoded) || /^\/\//.test(decoded)) return decoded;
   }catch{}
   return null;
@@ -115,40 +120,91 @@ function extractMediaFireCandidates(html,baseUrl){
   const out=[];
   const add=(v)=>{
     const u=normalizeCandidateUrl(v,baseUrl);
-    if(u && !out.includes(u)) out.push(u);
+    if(u && /^https?:\/\/download\d*\.mediafire\.com\//i.test(u) && !out.includes(u)) out.push(u);
   };
 
-  // 1) Botão oficial: href + data-scrambled-url.
-  const buttonRe=/<a\b[^>]*id=["']downloadButton["'][^>]*>/gi;
+  // MediaFire pode colocar o link real no botão, no atributo obfuscado ou em JS.
+  const allScrambled=/data-scrambled-url=["']([^"']+)["']/gi;
   let m;
+  while((m=allScrambled.exec(html))){
+    const decoded=decodeScrambledUrl(m[1]);
+    if(decoded) add(decoded);
+  }
+
+  const directRe=/https?:\/\/download\d*\.mediafire\.com\/[^\s"'<>]+/gi;
+  while((m=directRe.exec(html))) add(m[0].replace(/\\/g,""));
+
+  const buttonRe=/<a\b[^>]*id=["']downloadButton["'][^>]*>/gi;
   while((m=buttonRe.exec(html))){
     const tag=m[0];
     const href=tag.match(/\bhref=["']([^"']+)["']/i);
     const scrambled=tag.match(/\bdata-scrambled-url=["']([^"']+)["']/i);
     const dataUrl=tag.match(/\b(?:data-url|data-href)=["']([^"']+)["']/i);
-    if(scrambled) add(decodeScrambledUrl(scrambled[1]));
-    if(dataUrl) add(dataUrl[1]);
-    if(href) add(href[1]);
+    if(scrambled){const u=decodeScrambledUrl(scrambled[1]); if(u)add(u)}
+    if(dataUrl)add(dataUrl[1]);
+    if(href)add(href[1]);
   }
 
-  // 2) Caso o atributo id venha depois do href.
+  // Variante em que o id vem depois do href.
   const buttonAlt=/<a\b[^>]*href=["']([^"']+)["'][^>]*id=["']downloadButton["'][^>]*>/gi;
   while((m=buttonAlt.exec(html))) add(m[1]);
 
-  // 3) Outras variantes encontradas em versões diferentes da página.
+  // Outras variáveis comuns usadas pelo MediaFire.
   for(const re of [
-    /\bdata-scrambled-url=["']([^"']+)["']/gi,
     /\b(?:downloadLink|download_url|downloadUrl|directDownload|downloadUrlText)\s*[:=]\s*["']([^"']+)["']/gi,
-    /\bhref=["']([^"']+)["'][^>]*(?:download|download_link)[^>]*>/gi,
-    /\bhttps?:\/\/download\d+\.mediafire\.com\/[^"'\\<>\s]+/gi
+    /["'](https?:\/\/download\d*\.mediafire\.com\/[^"]+)["']/gi
   ]){
     while((m=re.exec(html))){
       const raw=m[1]||m[0];
-      const decoded=decodeScrambledUrl(raw);
-      add(decoded||raw);
+      add(decodeScrambledUrl(raw)||raw);
     }
   }
   return out;
+}
+
+function extractMediaFireQuickKey(url){
+  try{
+    const u=new URL(url);
+    const m=u.pathname.match(/\/file\/([A-Za-z0-9]+)/i);
+    if(m) return m[1];
+    const q=u.searchParams.get("quick_key");
+    return q || null;
+  }catch{return null}
+}
+
+async function resolveMediaFireViaApi(url){
+  const quickKey=extractMediaFireQuickKey(url);
+  if(!quickKey) return null;
+  const endpoints=[
+    `https://www.mediafire.com/api/1.5/file/get_info.php?quick_key=${encodeURIComponent(quickKey)}&response_format=json`,
+    `https://www.mediafire.com/api/file/get_info.php?quick_key=${encodeURIComponent(quickKey)}&response_format=json`
+  ];
+  for(const endpoint of endpoints){
+    try{
+      const r=await fetch(endpoint,{redirect:"follow",headers:{
+        "User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+        "Accept":"application/json,text/plain,*/*",
+        "Referer":"https://www.mediafire.com/"
+      }});
+      if(!r.ok) continue;
+      const data=await r.json();
+      const fi=data?.response?.file_info || data?.response?.file_infos?.[0];
+      if(!fi) continue;
+      const links=fi.links || {};
+      const candidates=[];
+      for(const key of ["direct_download","normal_download","download"]){
+        const v=links[key];
+        if(typeof v === "string") candidates.push(v);
+      }
+      for(const candidate of candidates){
+        const probe=await probeArchiveCandidate(candidate);
+        if(probe && probe.magic){
+          return {downloadUrl:probe.downloadUrl,filename:probe.filename||fi.filename||null,type:probe.magic};
+        }
+      }
+    }catch{}
+  }
+  return null;
 }
 
 async function probeArchiveCandidate(url){
@@ -157,7 +213,8 @@ async function probeArchiveCandidate(url){
     const timer=setTimeout(()=>controller.abort(),12000);
     const r=await fetch(url,{redirect:"follow",signal:controller.signal,headers:{
       "User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
-      "Range":"bytes=0-8191"
+      "Range":"bytes=0-8191",
+      "Accept":"*/*"
     }});
     clearTimeout(timer);
     if(!r.ok) return null;
@@ -165,9 +222,6 @@ async function probeArchiveCandidate(url){
     const ct=r.headers.get("content-type")||"";
     const cd=r.headers.get("content-disposition")||"";
     const name=dispositionName(cd);
-
-    // Lemos somente o primeiro chunk. Assim um teste de candidato nunca
-    // baixa um ZIP/RAR/7Z inteiro para a memória do Render.
     const reader=r.body?.getReader();
     let buf=Buffer.alloc(0);
     if(reader){
@@ -198,10 +252,8 @@ async function resolveMediaFire(url){
 
   const html=await r.text();
   const candidates=extractMediaFireCandidates(html,finalUrl);
+  console.log(`MediaFire: ${candidates.length} candidato(s) direto(s) encontrado(s) na página.`);
 
-  console.log(`MediaFire: ${candidates.length} candidato(s) encontrado(s).`);
-
-  // Primeiro os links do botão oficial; depois qualquer candidato direto.
   for(const candidate of candidates){
     const probe=await probeArchiveCandidate(candidate);
     if(probe && probe.magic){
@@ -210,7 +262,16 @@ async function resolveMediaFire(url){
     }
   }
 
-  throw new Error("O MediaFire foi acessado, mas o link direto do arquivo não foi resolvido automaticamente. O servidor encontrou a página, porém precisa localizar o endereço real do botão de download.");
+  // Fallback importante: algumas respostas do MediaFire não entregam o
+  // data-scrambled-url no HTML recebido pelo servidor, mas a API pública de
+  // informações ainda consegue retornar os links do arquivo.
+  const apiResult=await resolveMediaFireViaApi(url);
+  if(apiResult){
+    console.log(`MediaFire: arquivo real encontrado pela API em ${apiResult.downloadUrl}`);
+    return apiResult;
+  }
+
+  throw new Error("O MediaFire foi acessado, mas o link direto do arquivo não foi resolvido automaticamente. O servidor tentou o botão/data-scrambled-url, links diretos na página e a API pública do MediaFire.");
 }
 async function resolveDownload(url){
   const u=new URL(url);
