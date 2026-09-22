@@ -11,11 +11,20 @@ const PORT = process.env.PORT || 3000;
 const MAX_DOWNLOAD_MB = Number(process.env.MAX_DOWNLOAD_MB || 500);
 const MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024;
 
+// Render/Linux pode instalar o binário do 7-Zip sem a permissão de execução.
+// Garantimos a permissão antes de qualquer tentativa de descompactação.
+try {
+  fs.chmodSync(path7za, 0o755);
+  console.log(`7-Zip pronto: ${path7za}`);
+} catch (e) {
+  console.warn(`Aviso: não foi possível ajustar a permissão do 7-Zip: ${e.message}`);
+}
+
 app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"4.0.0",
+  ok:true, project:"furia-mods-ia", version:"4.0.1",
   archiveDetection:["zip","rar","7z"]
 }));
 
@@ -177,7 +186,7 @@ app.post("/api/analyze",async(req,res)=>{
       const n=resolved.filename||"";
       type=archiveType(n,"",resolved.downloadUrl)||"ARQUIVO";
     }
-    res.json({ok:true,version:"4.0.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"4.0.1",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
