@@ -24,7 +24,7 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.2.0",
+  ok:true, project:"furia-mods-ia", version:"5.4.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -172,37 +172,68 @@ function extractMediaFireQuickKey(url){
   }catch{return null}
 }
 
+function collectMediaFireLinkCandidates(data){
+  const out=[];
+  const add=(v)=>{
+    if(typeof v !== "string" || !/^https?:\/\//i.test(v)) return;
+    if(!out.includes(v)) out.push(v);
+  };
+  const response=data?.response||data;
+  const arrays=[response?.links,response?.file_info?.links,response?.file_infos?.[0]?.links];
+  for(const links of arrays){
+    if(Array.isArray(links)){
+      for(const item of links){
+        if(typeof item === "string") add(item);
+        else if(item && typeof item === "object"){
+          for(const key of ["direct_download","normal_download","download"]) add(item[key]);
+        }
+      }
+    } else if(links && typeof links === "object"){
+      for(const key of ["direct_download","normal_download","download"]) add(links[key]);
+    }
+  }
+  for(const key of ["direct_download","normal_download","download"]){
+    add(response?.[key]);
+  }
+  return out;
+}
 async function resolveMediaFireViaApi(url){
   const quickKey=extractMediaFireQuickKey(url);
   if(!quickKey) return null;
+  // O endpoint correto para links de download é file/get_links.
+  // get_info é útil para metadados, mas não é confiável como fonte do link real.
   const endpoints=[
-    `https://www.mediafire.com/api/1.5/file/get_info.php?quick_key=${encodeURIComponent(quickKey)}&response_format=json`,
-    `https://www.mediafire.com/api/file/get_info.php?quick_key=${encodeURIComponent(quickKey)}&response_format=json`
+    `https://www.mediafire.com/api/1.5/file/get_links.php?link_type=direct_download&quick_key=${encodeURIComponent(quickKey)}&response_format=json`,
+    `https://www.mediafire.com/api/1.5/file/get_links.php?link_type=normal_download&quick_key=${encodeURIComponent(quickKey)}&response_format=json`,
+    `https://www.mediafire.com/api/file/get_links.php?link_type=direct_download&quick_key=${encodeURIComponent(quickKey)}&response_format=json`,
+    `https://www.mediafire.com/api/file/get_links.php?link_type=normal_download&quick_key=${encodeURIComponent(quickKey)}&response_format=json`
   ];
   for(const endpoint of endpoints){
     try{
       const r=await fetch(endpoint,{redirect:"follow",headers:{
         "User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
         "Accept":"application/json,text/plain,*/*",
-        "Referer":"https://www.mediafire.com/"
+        "Referer":url
       }});
       if(!r.ok) continue;
-      const data=await r.json();
-      const fi=data?.response?.file_info || data?.response?.file_infos?.[0];
-      if(!fi) continue;
-      const links=fi.links || {};
-      const candidates=[];
-      for(const key of ["direct_download","normal_download","download"]){
-        const v=links[key];
-        if(typeof v === "string") candidates.push(v);
+      const text=await r.text();
+      let data=null;
+      try{data=JSON.parse(text)}catch{}
+      const candidates=collectMediaFireLinkCandidates(data);
+      // Algumas respostas antigas podem vir em XML mesmo pedindo JSON.
+      const xmlCandidates=[];
+      for(const re of [/<(?:direct_download|normal_download)>([^<]+)<\/(?:direct_download|normal_download)>/gi]){
+        let m; while((m=re.exec(text))) xmlCandidates.push(m[1]);
       }
-      for(const candidate of candidates){
+      for(const candidate of [...candidates,...xmlCandidates]){
         const probe=await probeArchiveCandidate(candidate);
         if(probe && probe.magic){
-          return {downloadUrl:probe.downloadUrl,filename:probe.filename||fi.filename||null,type:probe.magic};
+          return {downloadUrl:probe.downloadUrl,filename:probe.filename||null,type:probe.magic};
         }
       }
-    }catch{}
+    }catch(e){
+      console.warn(`MediaFire API get_links falhou: ${e.message}`);
+    }
   }
   return null;
 }
@@ -471,7 +502,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.2.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"5.4.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
