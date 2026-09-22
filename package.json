@@ -1,12 +1,17 @@
 {
   "name": "furia-mods-ia",
-  "version": "5.4.0",
+  "version": "5.5.0",
   "description": "Painel de automação do Fúria Mods",
   "main": "server.js",
-  "scripts": {"start": "node server.js"},
-  "engines": {"node": "22.x"},
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
     "express": "^5.1.0",
-    "7zip-bin": "^5.2.0"
+    "7zip-bin": "^5.2.0",
+    "playwright": "^1.55.0"
   }
 }

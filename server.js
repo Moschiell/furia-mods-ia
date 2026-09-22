@@ -5,6 +5,8 @@ const path = require("path");
 const os = require("os");
 const { spawn } = require("child_process");
 const { path7za } = require("7zip-bin");
+let chromium = null;
+try { ({ chromium } = require("playwright")); } catch (e) { console.warn("Playwright não disponível; fallback de navegador desativado."); }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,7 +26,7 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.4.0",
+  ok:true, project:"furia-mods-ia", version:"5.5.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -304,9 +306,92 @@ async function resolveMediaFire(url){
 
   throw new Error("O MediaFire foi acessado, mas o link direto do arquivo não foi resolvido automaticamente. O servidor tentou o botão/data-scrambled-url, links diretos na página e a API pública do MediaFire.");
 }
+
+async function resolveWithBrowser(url){
+  if(!chromium) throw new Error("O navegador automático não está disponível no servidor.");
+  const browser=await chromium.launch({headless:true});
+  let context=null, page=null;
+  try{
+    context=await browser.newContext({acceptDownloads:true,userAgent:"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"});
+    page=await context.newPage();
+    const downloadPromise=new Promise(resolve=>{
+      page.once("download", d=>resolve(d));
+      setTimeout(()=>resolve(null),30000);
+    });
+    await page.goto(url,{waitUntil:"domcontentloaded",timeout:30000});
+    const host=new URL(url).hostname.toLowerCase();
+
+    // MediaFire pode apresentar uma tela de confirmação de segurança antes do download.
+    if(host.includes("mediafire.com")){
+      const checkbox=page.locator('input[type="checkbox"]').first();
+      if(await checkbox.count() && await checkbox.isVisible().catch(()=>false)) await checkbox.check().catch(()=>{});
+      for(const selector of [
+        'button:has-text("Download Anyway")',
+        'a:has-text("Download Anyway")',
+        'button:has-text("Baixar mesmo assim")',
+        'a:has-text("Baixar mesmo assim")',
+        '#downloadButton'
+      ]){
+        const el=page.locator(selector).first();
+        if(await el.count() && await el.isVisible().catch(()=>false)){
+          await el.click().catch(()=>{});
+          break;
+        }
+      }
+    }
+
+    // ShareMods normalmente exige Create download link e depois Start Download.
+    if(host.includes("sharemods.com")){
+      for(const selector of [
+        'button:has-text("Create download link")',
+        'a:has-text("Create download link")',
+        'input[value*="Create download"]'
+      ]){
+        const el=page.locator(selector).first();
+        if(await el.count() && await el.isVisible().catch(()=>false)){
+          await el.click().catch(()=>{});
+          break;
+        }
+      }
+      await page.waitForTimeout(1500);
+      for(const selector of [
+        'button:has-text("Start Download")',
+        'a:has-text("Start Download")',
+        'button:has-text("Download")',
+        'a[href*="cgi-bin/dl.cgi"]'
+      ]){
+        const el=page.locator(selector).first();
+        if(await el.count() && await el.isVisible().catch(()=>false)){
+          await el.click().catch(()=>{});
+          break;
+        }
+      }
+    }
+
+    const dl=await downloadPromise;
+    if(!dl) throw new Error("O navegador abriu a página, mas não recebeu um download do arquivo.");
+    const target=path.join(os.tmpdir(),`furia-browser-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
+    await dl.saveAs(target);
+    const magic=await detectArchiveTypeByMagicBytes(target);
+    if(!magic){
+      try{await fsp.rm(target,{force:true})}catch{}
+      throw new Error("O navegador iniciou um download, mas o conteúdo recebido não é um ZIP, RAR ou 7Z válido.");
+    }
+    return {localPath:target,filename:dl.suggestedFilename(),type:magic};
+  } finally {
+    await browser.close().catch(()=>{});
+  }
+}
+
 async function resolveDownload(url){
   const u=new URL(url);
-  if(u.hostname.toLowerCase().includes("mediafire.com")) return resolveMediaFire(url);
+  if(u.hostname.toLowerCase().includes("mediafire.com")) {
+    try { return await resolveMediaFire(url); }
+    catch (e) {
+      console.warn(`MediaFire por HTTP falhou: ${e.message}. Tentando navegador automático...`);
+      return resolveWithBrowser(url);
+    }
+  }
 
   const r=await fetchPage(url);
   const ct=r.headers.get("content-type")||"";
@@ -314,7 +399,10 @@ async function resolveDownload(url){
   const name=dispositionName(cd);
   const type=archiveType(name,ct,r.url);
   if(type) return {downloadUrl:r.url,filename:name,type};
-  throw new Error("O link não entregou ZIP, RAR ou 7Z diretamente. Links de página são resolvidos automaticamente para MediaFire.");
+  try { return await resolveWithBrowser(url); }
+  catch (browserError) {
+    throw new Error(`O link não entregou ZIP, RAR ou 7Z diretamente. Navegador automático também falhou: ${browserError.message}`);
+  }
 }
 
 async function downloadFile(url,target){
@@ -482,7 +570,15 @@ app.post("/api/analyze",async(req,res)=>{
     new URL(source);
     const resolved=await resolveDownload(source);
     archive=path.join(os.tmpdir(),`furia-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
-    const dl=await downloadFile(resolved.downloadUrl,archive);
+    let dl;
+    if(resolved.localPath){
+      await fsp.copyFile(resolved.localPath,archive);
+      const st=await fsp.stat(archive);
+      dl={bytes:st.size,contentType:"application/octet-stream"};
+      try{await fsp.rm(resolved.localPath,{force:true})}catch{}
+    } else {
+      dl=await downloadFile(resolved.downloadUrl,archive);
+    }
 
     // ===== Validação por magic bytes (obrigatória antes de extrair) =====
     // Não confiamos na extensão/Content-Type: conferimos a assinatura real do
@@ -502,7 +598,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.4.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"5.5.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -515,4 +611,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V5.2 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V5.5 rodando na porta ${PORT}`));
