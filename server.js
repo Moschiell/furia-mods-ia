@@ -1,19 +1,193 @@
-const express=require("express");const AdmZip=require("adm-zip");const fs=require("fs");const path=require("path");const os=require("os");
-const app=express(),PORT=process.env.PORT||3000,MAX_MB=Number(process.env.MAX_DOWNLOAD_MB||500),MAX_BYTES=MAX_MB*1024*1024;
-app.use(express.json({limit:"2mb"}));app.use(express.static(path.join(__dirname,"public")));
-app.get("/health",(req,res)=>res.json({ok:true,project:"furia-mods-ia",version:"3.0.0",mediafireResolver:true}));
-function disp(v){if(!v)return null;const m=v.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i);return m?decodeURIComponent(m[1].replace(/^"|"$/g,"")):null}
-function isZip(ct,url,name=""){return `${ct||""} ${url||""} ${name||""}`.toLowerCase().includes("zip")||/\.zip(?:$|[?#])/i.test(url||"")||/\.zip$/i.test(name||"")}
-async function resolveMediaFire(url){const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"}});if(!r.ok)throw Error(`Não foi possível acessar o link (HTTP ${r.status}).`);const final=r.url,ct=r.headers.get("content-type")||"";if(isZip(ct,final))return{downloadUrl:final,filename:disp(r.headers.get("content-disposition"))};const html=await r.text(),cs=[];
-const patterns=[/href=["']([^"']+)["'][^>]*class=["'][^"']*download[^"']*["']/gi,/href=["']([^"']+)["'][^>]*id=["'][^"']*download[^"']*["']/gi,/aria-label=["'][^"']*download[^"']*["'][^>]*href=["']([^"']+)["']/gi,/https?:\/\/[^"'\\\s<>]+/gi];
-for(const re of patterns){let m;while((m=re.exec(html))!==null){const c=m[1]||m[0];try{const u=new URL(c,final).toString();if(!cs.includes(u))cs.push(u)}catch{}}}
-const ordered=[...cs.filter(u=>/download|mediafire|\.zip/i.test(u)),...cs];
-for(const u of ordered){try{const h=await fetch(u,{method:"HEAD",redirect:"follow",headers:{"User-Agent":"Mozilla/5.0"}}),hct=h.headers.get("content-type")||"",cd=h.headers.get("content-disposition")||"";if(h.ok&&(isZip(hct,h.url,cd)||/\.zip(?:$|[?#])/i.test(h.url)))return{downloadUrl:h.url,filename:disp(cd)}}catch{}}
-for(const u of ordered){try{const h=await fetch(u,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0","Range":"bytes=0-0"}}),hct=h.headers.get("content-type")||"",cd=h.headers.get("content-disposition")||"";if(h.ok&&(isZip(hct,h.url,cd)||/\.zip(?:$|[?#])/i.test(h.url))){try{await h.body?.cancel()}catch{}return{downloadUrl:h.url,filename:disp(cd)} }try{await h.body?.cancel()}catch{}}catch{}}
-throw Error("Não encontrei o download do ZIP nessa página do MediaFire.")}
-async function resolveDownload(url){const p=new URL(url);if(p.hostname.toLowerCase().includes("mediafire.com"))return resolveMediaFire(url);const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0"}}),ct=r.headers.get("content-type")||"",cd=r.headers.get("content-disposition")||"";if(!r.ok)throw Error(`Falha ao acessar o link (HTTP ${r.status}).`);if(isZip(ct,r.url,cd))return{downloadUrl:r.url,filename:disp(cd)};throw Error("O link não entregou um ZIP diretamente. Links de página são suportados automaticamente para MediaFire.")}
-async function downloadFile(url,target){const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0"}});if(!r.ok)throw Error(`Falha no download (HTTP ${r.status}).`);const len=Number(r.headers.get("content-length")||0);if(len>MAX_BYTES)throw Error(`O arquivo excede o limite de ${MAX_MB} MB.`);const f=fs.createWriteStream(target);let total=0;try{for await(const chunk of r.body){total+=chunk.length;if(total>MAX_BYTES){f.destroy();throw Error(`O arquivo excede o limite de ${MAX_MB} MB.`)}if(!f.write(chunk))await new Promise(x=>f.once("drain",x))}f.end();await new Promise((x,y)=>{f.on("finish",x);f.on("error",y)})}catch(e){f.destroy();throw e}return{bytes:total}}
-function analyzeZip(file){const z=new AdmZip(file),es=z.getEntries(),files=es.filter(e=>!e.isDirectory),names=files.map(e=>e.entryName),find=re=>names.find(n=>re.test(path.basename(n)))||null,meta=find(/^meta\.xml$/i),read=find(/^(readme|leia[-_ ]?me)(\.[^.]+)?$/i),imgs=files.filter(e=>/\.(png|jpe?g|webp|gif)$/i.test(e.entryName)),texts=files.filter(e=>/\.(txt|md|xml|json|cfg|ini|lua|js)$/i.test(e.entryName));let metaText="",readText="";try{if(meta)metaText=z.readAsText(meta).slice(0,20000)}catch{}try{if(read)readText=z.readAsText(read).slice(0,20000)}catch{}return{fileCount:files.length,directoryCount:es.length-files.length,totalUncompressedBytes:files.reduce((s,e)=>s+(e.header?.size||0),0),images:imgs.map(e=>e.entryName).slice(0,30),metaXml:meta?metaText:null,readme:read?readText:null,textFiles:texts.map(e=>e.entryName).slice(0,50),topLevel:[...new Set(names.map(n=>n.split("/")[0]).filter(Boolean))].slice(0,50)}}
-function preview(name,a){return{titulo:name.replace(/\.zip$/i,"").replace(/[_-]+/g," ").trim()||"Mod sem título identificado",descricao:"Descrição será preenchida a partir das informações encontradas no mod.",autor:"Identificar no arquivo",comandos:"Identificar no arquivo",peso:`${(a.totalUncompressedBytes/1024).toFixed(1)} KB`,imagem:a.images[0]||null}}
-app.post("/api/analyze",async(req,res)=>{const source=String(req.body?.url||"").trim();if(!source)return res.status(400).json({ok:false,error:"Informe o link do mod."});let tmp=null;try{new URL(source);const r=await resolveDownload(source),name=r.filename||new URL(r.downloadUrl).pathname.split("/").pop()||"mod.zip";if(!/\.zip$/i.test(name)&&!/\.zip(?:$|[?#])/i.test(r.downloadUrl))throw Error("O download encontrado não parece ser um arquivo ZIP.");tmp=path.join(os.tmpdir(),`furia-${Date.now()}-${Math.random().toString(16).slice(2)}.zip`);const d=await downloadFile(r.downloadUrl,tmp),a=analyzeZip(tmp);res.json({ok:true,version:"3.0.0",sourceUrl:source,downloadUrl:r.downloadUrl,file:{name,bytes:d.bytes,sizeMB:+(d.bytes/1024/1024).toFixed(2)},analysis:a,preview:preview(name,a)})}catch(e){console.error(e);res.status(400).json({ok:false,error:e.message||"Não foi possível analisar o mod."})}finally{if(tmp)try{fs.unlinkSync(tmp)}catch{}}});
-app.listen(PORT,()=>console.log(`Fúria Mods IA V3.0 rodando na porta ${PORT}`));
+const express = require("express");
+const fs = require("fs");
+const fsp = fs.promises;
+const path = require("path");
+const os = require("os");
+const { spawn } = require("child_process");
+const { path7za } = require("7zip-bin");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const MAX_DOWNLOAD_MB = Number(process.env.MAX_DOWNLOAD_MB || 500);
+const MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024;
+
+app.use(express.json({limit:"2mb"}));
+app.use(express.static(path.join(__dirname,"public")));
+
+app.get("/health",(req,res)=>res.json({
+  ok:true, project:"furia-mods-ia", version:"4.0.0",
+  archiveDetection:["zip","rar","7z"]
+}));
+
+function dispositionName(v){
+  if(!v) return null;
+  const m=v.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i);
+  return m ? decodeURIComponent(m[1].replace(/^"|"$/g,"")) : null;
+}
+function isArchiveName(v){ return /\.(zip|rar|7z)$/i.test(v||""); }
+function archiveType(name="",ct="",url=""){
+  const s=`${name} ${ct} ${url}`.toLowerCase();
+  if(s.includes(".rar")||s.includes("rar")) return "RAR";
+  if(s.includes(".7z")||s.includes("7z")) return "7Z";
+  if(s.includes(".zip")||s.includes("zip")) return "ZIP";
+  return null;
+}
+
+async function fetchPage(url){
+  const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"}});
+  if(!r.ok) throw new Error(`Não foi possível acessar o link (HTTP ${r.status}).`);
+  return r;
+}
+
+async function resolveMediaFire(url){
+  const r=await fetchPage(url);
+  const finalUrl=r.url;
+  const ct=r.headers.get("content-type")||"";
+  const cd=r.headers.get("content-disposition")||"";
+  const directType=archiveType(cd,ct,finalUrl);
+  if(directType) return {downloadUrl:finalUrl,filename:dispositionName(cd),type:directType};
+
+  const html=await r.text();
+  const candidates=[];
+  const add=(u)=>{
+    try{
+      const a=new URL(u,finalUrl).toString();
+      if(!candidates.includes(a)) candidates.push(a);
+    }catch{}
+  };
+
+  // Common MediaFire download attributes plus URLs embedded in page scripts.
+  for(const re of [
+    /href=["']([^"']+)["'][^>]*(?:download|download_link|downloadButton)[^>]*>/gi,
+    /(?:downloadLink|download_url|downloadUrl|directDownload|downloadUrlText)\s*[:=]\s*["']([^"']+)["']/gi,
+    /https?:\/\/[^"'\\\s<>]+/gi
+  ]){
+    let m;
+    while((m=re.exec(html))) add(m[1]||m[0]);
+  }
+
+  const ordered=candidates.sort((a,b)=>(/download/i.test(b)?1:0)-(/download/i.test(a)?1:0));
+  for(const candidate of ordered){
+    try{
+      const x=await fetch(candidate,{redirect:"follow",method:"GET",headers:{
+        "User-Agent":"Mozilla/5.0","Range":"bytes=0-4095"
+      }});
+      const xct=x.headers.get("content-type")||"";
+      const xcd=x.headers.get("content-disposition")||"";
+      const type=archiveType(xcd,xct,x.url);
+      const name=dispositionName(xcd);
+      if(x.ok && (type || isArchiveName(x.url) || isArchiveName(name))){
+        try{await x.body?.cancel()}catch{}
+        return {downloadUrl:x.url,filename:name,type:type||archiveType(name,"",x.url)||"DESCONHECIDO"};
+      }
+      try{await x.body?.cancel()}catch{}
+    }catch{}
+  }
+  throw new Error("O MediaFire não expôs um download de arquivo reconhecível.");
+}
+
+async function resolveDownload(url){
+  const u=new URL(url);
+  if(u.hostname.toLowerCase().includes("mediafire.com")) return resolveMediaFire(url);
+
+  const r=await fetchPage(url);
+  const ct=r.headers.get("content-type")||"";
+  const cd=r.headers.get("content-disposition")||"";
+  const name=dispositionName(cd);
+  const type=archiveType(name,ct,r.url);
+  if(type) return {downloadUrl:r.url,filename:name,type};
+  throw new Error("O link não entregou ZIP, RAR ou 7Z diretamente. Links de página são resolvidos automaticamente para MediaFire.");
+}
+
+async function downloadFile(url,target){
+  const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"Mozilla/5.0"}});
+  if(!r.ok) throw new Error(`Falha no download (HTTP ${r.status}).`);
+  const len=Number(r.headers.get("content-length")||0);
+  if(len>MAX_DOWNLOAD_BYTES) throw new Error(`O arquivo excede o limite de ${MAX_DOWNLOAD_MB} MB.`);
+  const out=fs.createWriteStream(target); let total=0;
+  try{
+    for await(const chunk of r.body){
+      total+=chunk.length;
+      if(total>MAX_DOWNLOAD_BYTES){out.destroy();throw new Error(`O arquivo excede o limite de ${MAX_DOWNLOAD_MB} MB.`);}
+      if(!out.write(chunk)) await new Promise(ok=>out.once("drain",ok));
+    }
+    out.end();
+    await new Promise((ok,bad)=>{out.on("finish",ok);out.on("error",bad)});
+  }catch(e){out.destroy();throw e}
+  return {bytes:total,contentType:r.headers.get("content-type")||""};
+}
+
+function extractArchive(archive,outDir){
+  return new Promise((resolve,reject)=>{
+    const child=spawn(path7za,["x","-y",`-o${outDir}`,archive],{stdio:["ignore","pipe","pipe"]});
+    let err="";
+    child.stderr.on("data",d=>err+=d.toString());
+    child.on("error",reject);
+    child.on("close",code=>{
+      if(code===0) resolve();
+      else reject(new Error(`Não foi possível descompactar o arquivo. O 7-Zip retornou código ${code}. ${err.slice(-800)}`));
+    });
+  });
+}
+
+async function walk(dir,root,arr=[]){
+  for(const ent of await fsp.readdir(dir,{withFileTypes:true})){
+    const full=path.join(dir,ent.name);
+    if(ent.isDirectory()) await walk(full,root,arr);
+    else arr.push({full,rel:path.relative(root,full).replaceAll(path.sep,"/"),size:(await fsp.stat(full)).size});
+    if(arr.length>=1000) break;
+  }
+  return arr;
+}
+async function readFirst(files,regex){
+  const f=files.find(x=>regex.test(path.basename(x.rel)));
+  if(!f)return null;
+  try{return (await fsp.readFile(f.full,"utf8")).slice(0,20000)}catch{return null}
+}
+async function analyzeArchive(archive,outDir){
+  await extractArchive(archive,outDir);
+  const files=await walk(outDir,outDir,[]);
+  const images=files.filter(x=>/\.(png|jpe?g|webp|gif)$/i.test(x.rel)).map(x=>x.rel).slice(0,30);
+  const text=files.filter(x=>/\.(txt|md|xml|json|cfg|ini|lua|js)$/i.test(x.rel)).map(x=>x.rel).slice(0,50);
+  const meta=await readFirst(files,/^meta\.xml$/i);
+  const readme=await readFirst(files,/^(readme|leia[-_ ]?me)(\.[^.]+)?$/i);
+  const top=[...new Set(files.map(x=>x.rel.split("/")[0]).filter(Boolean))].slice(0,50);
+  return {fileCount:files.length,totalBytes:files.reduce((a,x)=>a+x.size,0),images,text,metaXml:meta,readme,topLevel:top,files:files.map(x=>x.rel).slice(0,100)};
+}
+function preview(name,a){
+  const title=name.replace(/\.(zip|rar|7z)$/i,"").replace(/[_-]+/g," ").trim();
+  return {titulo:title||"Mod sem título identificado",descricao:"Descrição será preenchida a partir das informações encontradas no mod.",autor:"Identificar no arquivo",comandos:"Identificar no arquivo",peso:`${(a.totalBytes/1024).toFixed(1)} KB`,imagem:a.images[0]||null};
+}
+
+app.post("/api/analyze",async(req,res)=>{
+  const source=String(req.body?.url||"").trim();
+  if(!source)return res.status(400).json({ok:false,error:"Informe o link do mod."});
+  let archive=null,out=null;
+  try{
+    new URL(source);
+    const resolved=await resolveDownload(source);
+    archive=path.join(os.tmpdir(),`furia-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
+    const dl=await downloadFile(resolved.downloadUrl,archive);
+    out=path.join(os.tmpdir(),`furia-out-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await fsp.mkdir(out);
+    let type=resolved.type;
+    // If the host omitted the extension/type, 7-Zip itself will identify the format.
+    const analysis=await analyzeArchive(archive,out);
+    if(type==="DESCONHECIDO"){
+      const n=resolved.filename||"";
+      type=archiveType(n,"",resolved.downloadUrl)||"ARQUIVO";
+    }
+    res.json({ok:true,version:"4.0.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+      name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
+      type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
+    },analysis,preview:preview(resolved.filename||"mod",analysis)});
+  }catch(e){
+    console.error("ANALYZE_ERROR",e);
+    res.status(400).json({ok:false,error:e.message||"Não foi possível analisar o mod."});
+  }finally{
+    if(archive)try{await fsp.rm(archive,{force:true})}catch{}
+    if(out)try{await fsp.rm(out,{recursive:true,force:true})}catch{}
+  }
+});
+
+app.listen(PORT,()=>console.log(`Fúria Mods IA V4.0 rodando na porta ${PORT}`));

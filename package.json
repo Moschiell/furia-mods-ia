@@ -1,1 +1,12 @@
-{"name":"furia-mods-ia","version":"3.0.0","description":"Painel de automação do Fúria Mods","main":"server.js","scripts":{"start":"node server.js"},"engines":{"node":"22.x"},"dependencies":{"adm-zip":"^0.5.16","express":"^5.1.0"}}
+{
+  "name": "furia-mods-ia",
+  "version": "4.0.0",
+  "description": "Painel de automação do Fúria Mods",
+  "main": "server.js",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": "22.x"},
+  "dependencies": {
+    "express": "^5.1.0",
+    "7zip-bin": "^5.2.0"
+  }
+}
