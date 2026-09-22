@@ -3,7 +3,7 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const { path7za } = require("7zip-bin");
 let chromium = null;
 try { ({ chromium } = require("playwright")); } catch (e) { console.warn("Playwright não disponível; fallback de navegador desativado."); }
@@ -12,6 +12,39 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_DOWNLOAD_MB = Number(process.env.MAX_DOWNLOAD_MB || 500);
 const MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024;
+
+let browserInstallPromise = null;
+
+async function ensurePlaywrightChromium(){
+  if(!chromium) throw new Error("Playwright não está disponível no servidor.");
+  const configured = process.env.CHROMIUM_PATH;
+  if(configured && fs.existsSync(configured)) return configured;
+  if(fs.existsSync("/usr/bin/chromium")) return "/usr/bin/chromium";
+
+  // O Render pode instalar o pacote Playwright sem baixar os navegadores.
+  // Nesse caso instalamos o Chromium sob demanda, uma única vez por processo.
+  if(!browserInstallPromise){
+    browserInstallPromise = (async()=>{
+      console.log("Chromium do Playwright não encontrado. Instalando o navegador automaticamente...");
+      try {
+        execFileSync(process.platform === "win32" ? "npx.cmd" : "npx", ["playwright","install","chromium"], {
+          cwd: __dirname,
+          stdio: "inherit",
+          env: {...process.env, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:"0"}
+        });
+      } catch(e) {
+        throw new Error(`Não foi possível instalar o Chromium do Playwright no Render: ${e.message}`);
+      }
+      const installed = chromium.executablePath();
+      if(!installed || !fs.existsSync(installed)){
+        throw new Error("O Chromium foi instalado, mas o executável não foi encontrado.");
+      }
+      console.log(`Chromium pronto: ${installed}`);
+      return installed;
+    })().catch(err=>{ browserInstallPromise=null; throw err; });
+  }
+  return browserInstallPromise;
+}
 
 // Render/Linux pode instalar o binário do 7-Zip sem a permissão de execução.
 // Garantimos a permissão antes de qualquer tentativa de descompactação.
@@ -26,7 +59,7 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.5.0",
+  ok:true, project:"furia-mods-ia", version:"5.7.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -315,8 +348,7 @@ async function resolveMediaFire(url){
 }
 
 async function resolveWithBrowser(url){
-  if(!chromium) throw new Error("O navegador automático não está disponível no servidor.");
-  const executablePath = process.env.CHROMIUM_PATH || (fs.existsSync("/usr/bin/chromium") ? "/usr/bin/chromium" : undefined);
+  const executablePath = await ensurePlaywrightChromium();
   const browser=await chromium.launch({
     headless:true,
     executablePath,
@@ -658,7 +690,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.5.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"5.7.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -671,4 +703,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V5.5 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V5.7 rodando na porta ${PORT}`));
