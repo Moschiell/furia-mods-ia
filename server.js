@@ -176,6 +176,81 @@ app.get("/api/catalog",async(req,res)=>{
   }
 });
 
+// ===== Página individual do recurso MTA Resources =====
+// Usada pelo botão "Processar mod". O downloader/analisador V5.9 permanece intacto.
+function escapeRegExp(v){return String(v).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
+function metaContent(html,name){
+  const n=escapeRegExp(name);
+  const re1=new RegExp(`<meta[^>]+(?:name|property)=["']${n}["'][^>]+content=["']([^"']*)["'][^>]*>`,`i`);
+  const re2=new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:name|property)=["']${n}["'][^>]*>`,`i`);
+  return (html.match(re1)||html.match(re2)||[])[1]||null;
+}
+function firstTextByLabel(html,labels){
+  const joined=labels.map(escapeRegExp).join("|");
+  const patterns=[
+    new RegExp(`(?:${joined})\\s*</?[^>]*>\\s*(?:<[^>]+>\\s*)?([^<]{2,500})`,`i`),
+    new RegExp(`(?:${joined})\\s*[:=]\\s*([^<\\n]{2,500})`,`i`),
+    new RegExp(`<[^>]*class=["'][^"']*(?:label|title|field|info)[^"']*["'][^>]*>\\s*(?:${joined})\\s*</[^>]+>\\s*<[^>]+>\\s*([^<]{2,500})`,`i`)
+  ];
+  for(const re of patterns){const m=html.match(re);if(m&&m[1])return stripHtml(m[1]);}
+  return null;
+}
+function extractMtaDownloadCandidates(html,base){
+  const out=[]; const seen=new Set();
+  const add=(raw)=>{
+    if(!raw)return;
+    const u=absoluteUrl(raw,base); if(!u)return;
+    if(!/^https?:/i.test(u) || /mtaresources\.com\.br\/resource\//i.test(u))return;
+    if(seen.has(u))return; seen.add(u); out.push(u);
+  };
+  const re=/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while((m=re.exec(html))){
+    const href=m[1], text=stripHtml(m[2]);
+    if(/mediafire\.com/i.test(href) || /sharemods\.com/i.test(href) || /\.(?:zip|rar|7z)(?:[?#]|$)/i.test(href) || /(?:download|baixar|arquivo|link do mod)/i.test(text)) add(href);
+  }
+  for(const m of html.matchAll(/https?:\/\/[^"'\s<>]+/gi)){
+    const u=m[0].replace(/[),.;]+$/g,"");
+    if(/mediafire\.com|sharemods\.com/i.test(u) || /\.(?:zip|rar|7z)(?:[?#]|$)/i.test(u)) add(u);
+  }
+  return out.sort((a,b)=>{
+    const score=u=>/mediafire\.com/i.test(u)?0:/sharemods\.com/i.test(u)?1:/\.(?:zip|rar|7z)(?:[?#]|$)/i.test(u)?2:3;
+    return score(a)-score(b);
+  });
+}
+function parseMtaResourcePage(html,resourceUrl){
+  const ogTitle=metaContent(html,"og:title");
+  const metaDesc=metaContent(html,"description") || metaContent(html,"og:description");
+  const titleRaw=ogTitle || firstAttr(html,[
+    /<h1[^>]*>\s*([\s\S]*?)\s*<\/h1>/i,
+    /<title[^>]*>\s*([\s\S]*?)\s*<\/title>/i
+  ]);
+  const slug=(new URL(resourceUrl).pathname.split("/").pop()||"").replace(/^\d+-/i,"").replace(/[-_]+/g," ").trim();
+  let title=stripHtml(titleRaw||"").replace(/\s*[|–—-]\s*(MTA Resources|Recursos MTA).*$/i,"").trim();
+  if(!title || /^(detalhes e download|download|ver recurso|mta resources|recursos mta)$/i.test(title)) title=slug;
+  const image=absoluteUrl(metaContent(html,"og:image") || firstAttr(html,[
+    /<img[^>]+(?:class|id)=["'][^"']*(?:cover|thumbnail|resource|mod)[^"']*["'][^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/i,
+    /<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/i
+  ]),resourceUrl);
+  const description=stripHtml(firstTextByLabel(html,["Descrição","Descricao","Description"]) || metaDesc || "");
+  const author=stripHtml(firstTextByLabel(html,["Autor","Author","Criador","Creator","Desenvolvedor","Developer"]) || "");
+  const commands=stripHtml(firstTextByLabel(html,["Comandos","Commands","Commandos"]) || "");
+  const category=guessCategory(html,resourceUrl);
+  const downloadCandidates=extractMtaDownloadCandidates(html,resourceUrl);
+  const date=stripHtml(firstTextByLabel(html,["Data","Publicado","Publicada","Data de publicação","Publicado em"]) || "");
+  return {title:title||"Recurso sem título identificado",description:description||null,author:author||null,commands:commands||null,category:category||"Não identificada",date:date||null,imageUrl:image||null,resourceUrl,downloadCandidates};
+}
+app.get("/api/resource",async(req,res)=>{
+  const source=String(req.query.url||"").trim();
+  if(!source)return res.status(400).json({ok:false,error:"Informe o link da página do recurso."});
+  try{
+    const u=new URL(source);
+    if(!/mtaresources\.com\.br$/i.test(u.hostname) || !/\/resource\//i.test(u.pathname)) throw new Error("O link informado não é uma página de recurso do MTA Resources.");
+    const r=await fetchPage(source); const html=await r.text();
+    res.json({ok:true,resource:parseMtaResourcePage(html,source)});
+  }catch(e){console.error("RESOURCE_PAGE_ERROR",e);res.status(400).json({ok:false,error:e.message||"Não foi possível ler a página do recurso."});}
+});
+
 app.get("/health",(req,res)=>res.json({
   ok:true, project:"furia-mods-ia", version:"6.1.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
@@ -866,4 +941,31 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V6.1 rodando na porta ${PORT}`));
+function buildResourcePreview(resource,a,resolved,fileName){
+  const archiveMeta=a.metadata||{}; const fallback=(v,archiveV,def)=>v||archiveV||def;
+  const title=resource.title||fileName.replace(/\.(zip|rar|7z)$/i,"").replace(/[_-]+/g," ").trim();
+  return {titulo:title||"Mod sem título identificado",imagem:resource.imageUrl||a.images[0]||null,descricao:fallback(resource.description,archiveMeta.descricao,"Não identificada"),autor:fallback(resource.author,archiveMeta.autor,"Desconhecido"),comandos:fallback(resource.commands,archiveMeta.comandos,"Não identificados"),peso:`${(a.totalBytes/1024).toFixed(1)} KB`,categoria:fallback(resource.category,archiveMeta.categoria,"Não identificada"),versao:archiveMeta.versao||"Não identificada",dependencias:archiveMeta.dependencias||"Não identificadas",instalacao:archiveMeta.instalacao||"Não identificada",link:resolved.downloadUrl||null,fonte:resource.resourceUrl,dataFonte:resource.date||null};
+}
+app.post("/api/process-resource",async(req,res)=>{
+  const source=String(req.body?.url||"").trim(); if(!source)return res.status(400).json({ok:false,error:"Informe o link do recurso."});
+  let archive=null,out=null;
+  try{
+    const u=new URL(source);
+    if(!/mtaresources\.com\.br$/i.test(u.hostname) || !/\/resource\//i.test(u.pathname)) throw new Error("O link informado não é uma página de recurso do MTA Resources.");
+    const page=await fetchPage(source); const resource=parseMtaResourcePage(await page.text(),source);
+    if(!resource.downloadCandidates.length) throw new Error("A página do recurso foi lida, mas nenhum link de download (MediaFire, ShareMods ou arquivo ZIP/RAR/7Z) foi encontrado.");
+    let resolved=null,lastError=null;
+    for(const candidate of resource.downloadCandidates.slice(0,8)){try{resolved=await resolveDownload(candidate);if(resolved)break}catch(e){lastError=e;console.warn(`RESOURCE_DOWNLOAD_CANDIDATE_ERROR ${candidate}: ${e.message}`);}}
+    if(!resolved)throw new Error(`O link do arquivo foi encontrado na página, mas não foi possível resolvê-lo automaticamente. ${lastError?.message||""}`.trim());
+    archive=path.join(os.tmpdir(),`furia-resource-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
+    let dl;
+    if(resolved.localPath){await fsp.copyFile(resolved.localPath,archive);const st=await fsp.stat(archive);dl={bytes:st.size,contentType:"application/octet-stream"};try{await fsp.rm(resolved.localPath,{force:true})}catch{}}else dl=await downloadFile(resolved.downloadUrl,archive);
+    const magicType=await detectArchiveTypeByMagicBytes(archive); if(!magicType)throw new Error("O download encontrado na página não é um ZIP, RAR ou 7Z válido.");
+    out=path.join(os.tmpdir(),`furia-resource-out-${Date.now()}-${Math.random().toString(16).slice(2)}`); await fsp.mkdir(out);
+    const analysis=await analyzeArchive(archive,out); const fileName=resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod";
+    res.json({ok:true,version:"6.2.0",sourceUrl:source,resource,file:{name:fileName,type:magicType,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes},analysis,preview:buildResourcePreview(resource,analysis,resolved,fileName)});
+  }catch(e){console.error("PROCESS_RESOURCE_ERROR",e);res.status(400).json({ok:false,error:e.message||"Não foi possível processar o recurso."});}
+  finally{if(archive)try{await fsp.rm(archive,{force:true})}catch{}if(out)try{await fsp.rm(out,{recursive:true,force:true})}catch{}}
+});
+
+app.listen(PORT,()=>console.log(`Fúria Mods IA V6.2 rodando na porta ${PORT}`));
