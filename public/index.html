@@ -1,22 +1,72 @@
 <!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fúria Mods — Analisador de Mods</title><link rel="stylesheet" href="/style.css"></head>
-<body><main class="container"><header><h1>FÚRIA MODS</h1><p>Analisador de Mods · V5.8</p></header>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fúria Mods — Catálogo e Analisador</title><link rel="stylesheet" href="/style.css"></head>
+<body><main class="container">
+<header><h1>FÚRIA MODS</h1><p>Catálogo e Analisador de Mods · V6.0</p></header>
+
+<section class="card catalog-card">
+  <div class="section-head"><div><h2>🆕 Mods mais recentes</h2><p class="hint">Todos os tipos do MTA Resources juntos. Mostrando 5 por vez.</p></div><button id="refreshCatalog" class="secondary">↻ Atualizar</button></div>
+  <div id="catalogStatus" class="hint">Carregando catálogo...</div>
+  <div id="catalog" class="catalog"></div>
+  <div class="catalog-footer"><button id="nextCatalog" class="secondary">Próximos 5</button></div>
+</section>
+
 <section class="card"><label for="url">Link do mod</label><input id="url" type="url" placeholder="MediaFire ou link direto do ZIP/RAR/7Z">
 <button id="analyze">Analisar mod</button><p class="hint">O servidor resolve o download no próprio Render e detecta ZIP, RAR e 7Z. Você não precisa baixar o arquivo no celular.</p><div id="status"></div></section>
 <section id="result" class="hidden"><div class="card"><h2>Arquivo</h2><div id="file"></div></div>
 <div class="card"><h2>Estrutura</h2><pre id="structure"></pre></div>
-<div class="card"><h2>Prévia Fúria Mods</h2><div id="preview"></div><button class="approve" id="approve">✅ Aprovar para próxima etapa</button></div></section></main>
+<div class="card"><h2>Prévia Fúria Mods</h2><div id="preview"></div><button class="approve" id="approve">✅ Aprovar para próxima etapa</button></div></section>
+</main>
 <script>
 const $=id=>document.getElementById(id);
+let catalogPage=1;
+
+function status(m,e=false){$("status").textContent=m;$("status").className=e?"error":"ok"}
+function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+
+function renderCatalog(items,page){
+  const box=$("catalog"); box.innerHTML="";
+  items.forEach((item,i)=>{
+    const card=document.createElement("article"); card.className="catalog-item";
+    const image=item.imageUrl?`<img src="${esc(item.imageUrl)}" alt="" loading="lazy" onerror="this.style.display='none'">`:"";
+    card.innerHTML=`${image?`<div class="catalog-image">${image}</div>`:"<div class="catalog-image placeholder">MTA</div>"}
+      <div class="catalog-body"><div class="catalog-top"><span class="badge">${esc(item.category||"Categoria não identificada")}</span>${item.date?`<span class="date">${esc(item.date)}</span>`:""}</div>
+      <h3>${esc(item.title)}</h3><p>${esc(item.description||"Descrição disponível na página do recurso.")}</p>
+      <div class="catalog-actions"><button class="analyze-catalog" data-url="${esc(item.resourceUrl)}">⚙ Processar mod</button><a href="${esc(item.resourceUrl)}" target="_blank" rel="noopener">Ver recurso ↗</a></div></div>`;
+    box.appendChild(card);
+  });
+  document.querySelectorAll(".analyze-catalog").forEach(btn=>btn.onclick=()=>{
+    $("url").value=btn.dataset.url;
+    $("url").scrollIntoView({behavior:"smooth",block:"center"});
+  });
+  $("catalogStatus").textContent=`Página ${page} · ${items.length} recurso(s) encontrados. A categoria de cada mod é preservada.`;
+}
+
+async function loadCatalog(page=1){
+  $("catalogStatus").textContent="Buscando os recursos mais recentes...";
+  $("catalog").innerHTML="";
+  $("nextCatalog").disabled=true; $("refreshCatalog").disabled=true;
+  try{
+    const r=await fetch(`/api/catalog?page=${page}&limit=5`); const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.error||"Falha ao carregar catálogo.");
+    catalogPage=page; renderCatalog(d.items,d.page);
+  }catch(e){
+    $("catalogStatus").innerHTML=`<span class="error-inline">${esc(e.message)}</span>`;
+  }finally{$("nextCatalog").disabled=false;$("refreshCatalog").disabled=false}
+}
+
+$("refreshCatalog").onclick=()=>loadCatalog(1);
+$("nextCatalog").onclick=()=>loadCatalog(catalogPage+1);
+loadCatalog(1);
+
 $("analyze").onclick=async()=>{const url=$("url").value.trim();if(!url)return status("Cole o link do mod primeiro.",true);
 status("Acessando o link e procurando o arquivo no servidor...");$("result").classList.add("hidden");$("analyze").disabled=true;
 try{const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});const d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"Falha na análise.");
 status("Análise concluída.");$("result").classList.remove("hidden");
 $("file").innerHTML="<strong>"+esc(d.file.name)+"</strong><br>"+esc(d.file.type)+" · "+d.file.sizeMB+" MB · "+d.analysis.fileCount+" arquivos";
 $("structure").textContent=JSON.stringify({pastas_principais:d.analysis.topLevel,imagens:d.analysis.images,meta_xml_encontrado:!!d.analysis.metaXml,readme_encontrado:!!d.analysis.readme,arquivos_texto:d.analysis.text},null,2);
-const p=d.preview;$("preview").innerHTML="<div class=\'preview\'><h3>"+esc(p.titulo)+"</h3><p><b>Descrição:</b> "+esc(p.descricao)+"</p><p><b>Autor:</b> "+esc(p.autor)+"</p><p><b>Comandos:</b> "+esc(p.comandos)+"</p><p><b>Versão:</b> "+esc(p.versao)+"</p><p><b>Categoria:</b> "+esc(p.categoria)+"</p><p><b>Dependências:</b> "+esc(p.dependencias)+"</p><p><b>Instalação:</b> "+esc(p.instalacao)+"</p><p><b>Peso:</b> "+esc(p.peso)+"</p><p><b>Imagem:</b> "+esc(p.imagem||"Nenhuma identificada")+"</p><p class=\'read-note\'>O servidor leu o conteúdo de "+esc(d.analysis.conteudo_textual?.length||0)+" arquivo(s) de texto.</p></div>";
+const p=d.preview;$("preview").innerHTML="<div class='preview'><h3>"+esc(p.titulo)+"</h3><p><b>Descrição:</b> "+esc(p.descricao)+"</p><p><b>Autor:</b> "+esc(p.autor)+"</p><p><b>Comandos:</b> "+esc(p.comandos)+"</p><p><b>Versão:</b> "+esc(p.versao)+"</p><p><b>Categoria:</b> "+esc(p.categoria)+"</p><p><b>Dependências:</b> "+esc(p.dependencias)+"</p><p><b>Instalação:</b> "+esc(p.instalacao)+"</p><p><b>Peso:</b> "+esc(p.peso)+"</p><p><b>Imagem:</b> "+esc(p.imagem||"Nenhuma identificada")+"</p><p class='read-note'>O servidor leu o conteúdo de "+esc(d.analysis.conteudo_textual?.length||0)+" arquivo(s) de texto.</p></div>";
 }catch(e){status(e.message,true)}finally{$("analyze").disabled=false}};
 $("approve").onclick=()=>status("Aprovado. A geração final da publicação será adicionada depois.");
-function status(m,e=false){$("status").textContent=m;$("status").className=e?"error":"ok"}function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 </script></body></html>
