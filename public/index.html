@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fúria Mods — Catálogo e Analisador</title><link rel="stylesheet" href="/style.css"></head>
 <body><main class="container">
-<header><h1>FÚRIA MODS</h1><p>Catálogo e Analisador de Mods · V6.2</p></header>
+<header><h1>FÚRIA MODS</h1><p>Catálogo e Analisador de Mods · V6.4</p></header>
 
 <section class="card catalog-card">
   <div class="section-head"><div><h2>🆕 Mods mais recentes</h2><p class="hint">Todos os tipos do MTA Resources juntos. Mostrando 5 por vez.</p></div><button id="refreshCatalog" class="secondary">↻ Atualizar</button></div>
@@ -16,13 +16,13 @@
   <div class="card post-card">
     <div class="section-head"><div><h2>📋 Prévia da publicação</h2><p class="hint">Gerada pelo Fúria Mods a partir da página do recurso + análise do arquivo.</p></div></div>
     <div id="resourcePostPreview"></div>
-    <div class="post-actions"><button class="approve" id="approveResource">✅ Aprovar publicação</button><button class="secondary" id="closeResource">Fechar prévia</button></div>
+    <div class="post-actions"><button class="approve" id="approveResource" disabled>✅ Aprovar publicação</button><button class="secondary" id="closeResource">Fechar prévia</button></div>
     <div id="resourceStatus" class="hint"></div>
   </div>
 </section>
 
-<section class="card"><label for="url">Análise manual</label><input id="url" type="url" placeholder="MediaFire ou link direto do ZIP/RAR/7Z"><input id="url" type="url" placeholder="MediaFire ou link direto do ZIP/RAR/7Z">
-<button id="analyze">Analisar mod</button><p class="hint">O servidor resolve o download no próprio Render e detecta ZIP, RAR e 7Z. Você não precisa baixar o arquivo no celular.</p><div id="status"></div></section>
+<section class="card"><label for="url">Análise manual</label><input id="url" type="url" placeholder="MediaFire ou link direto do ZIP/RAR/7Z">
+<button id="analyze">Analisar mod</button><p class="hint">O servidor procura a hospedagem do mod, segue redirecionamentos e tenta resolver o arquivo automaticamente. Você não precisa baixar o arquivo no celular.</p><div id="status"></div></section>
 <section id="result" class="hidden"><div class="card"><h2>Arquivo</h2><div id="file"></div></div>
 <div class="card"><h2>Estrutura</h2><pre id="structure"></pre></div>
 <div class="card"><h2>Prévia Fúria Mods</h2><div id="preview"></div><button class="approve" id="approve">✅ Aprovar para próxima etapa</button></div></section>
@@ -65,11 +65,8 @@ function renderCatalog(items,page){
     const title=document.createElement("h3"); title.textContent=item.title||"Recurso sem título";
     const desc=document.createElement("p"); desc.textContent=item.description||"Descrição disponível na página do recurso.";
     const actions=document.createElement("div"); actions.className="catalog-actions";
-    const process=document.createElement("button"); process.className="analyze-catalog"; process.type="button"; process.textContent="⚙ Processar mod"; process.dataset.url=item.resourceUrl||"";
-    process.onclick=()=>processResource(process.dataset.url,process);
-    const link=document.createElement("button"); link.className="preview-catalog secondary"; link.type="button"; link.textContent="👁 Ver prévia";
-    link.onclick=()=>previewResource(process.dataset.url,link);
-    actions.append(process,link);
+    const process=document.createElement("button"); process.className="analyze-catalog"; process.type="button"; process.textContent="⚙ Processar e gerar prévia"; process.dataset.url=item.resourceUrl||"";
+    process.onclick=()=>processResource(process.dataset.url,process); actions.append(process);
     body.append(top,title,desc,actions);
     card.append(imageWrap,body);
     box.appendChild(card);
@@ -99,27 +96,31 @@ async function loadCatalog(page=1){
   }
 }
 
-async function previewResource(url,button){
-  if(!url)return;
-  button.disabled=true; const old=button.textContent; button.textContent="Carregando...";
-  try{const r=await fetch(`/api/resource?url=${encodeURIComponent(url)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"Falha ao ler o recurso.");renderResourcePostPreview(d.resource,null);$("resourceResult").classList.remove("hidden");$("resourceStatus").textContent="Prévia básica carregada. Use Processar mod para baixar e analisar o arquivo.";$("resourceResult").scrollIntoView({behavior:"smooth",block:"start"});}
-  catch(e){alert(e.message||"Não foi possível ler o recurso.");}
-  finally{button.disabled=false;button.textContent=old;}
-}
-
 async function processResource(url,button){
   if(!url)return;
-  const old=button.textContent;button.disabled=true;button.textContent="⏳ Processando...";$("resourceResult").classList.remove("hidden");$("resourceStatus").textContent="Acessando a página, procurando o download e analisando o arquivo no Render...";
-  try{const r=await fetch("/api/process-resource",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});const d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"Falha ao processar o recurso.");renderResourcePostPreview(d.resource,d.preview,d.file);$("resourceStatus").textContent=`Processamento concluído · ${d.file.type} · ${d.file.sizeMB} MB · ${d.analysis.fileCount} arquivo(s) analisado(s).`;$("resourceResult").scrollIntoView({behavior:"smooth",block:"start"});}
-  catch(e){$("resourceStatus").innerHTML=`<span class="error-inline">${esc(e.message||"Não foi possível processar o recurso.")}</span>`;$("resourceResult").scrollIntoView({behavior:"smooth",block:"start"});}
-  finally{button.disabled=false;button.textContent=old;}
+  const old=button.textContent;button.disabled=true;button.textContent="⏳ Processando...";
+  $("resourceResult").classList.remove("hidden");
+  $("resourcePostPreview").innerHTML="";
+  $("approveResource").disabled=true;
+  $("resourceStatus").textContent="Lendo o recurso, procurando o arquivo e analisando o MOD no Render...";
+  try{
+    const r=await fetch("/api/process-resource",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.error||"Falha ao processar o recurso.");
+    renderResourcePostPreview(d.resource,d.preview,d.file);
+    $("approveResource").disabled=false;
+    $("resourceStatus").textContent=`MOD processado com sucesso · ${d.file.type} · ${d.file.sizeMB} MB · ${d.analysis.fileCount} arquivo(s) analisado(s).`;
+    $("resourceResult").scrollIntoView({behavior:"smooth",block:"start"});
+  }catch(e){
+    $("resourceStatus").innerHTML=`<span class="error-inline">${esc(e.message||"Não foi possível processar o mod.")}</span>`;
+    $("resourceResult").scrollIntoView({behavior:"smooth",block:"start"});
+  }finally{button.disabled=false;button.textContent=old;}
 }
-
 function renderResourcePostPreview(resource,post,file){
   const p=post||{titulo:resource?.title||"Mod sem título identificado",imagem:resource?.imageUrl||null,descricao:resource?.description||"Não identificada",autor:resource?.author||"Desconhecido",comandos:resource?.commands||"Não identificados",categoria:resource?.category||"Não identificada",peso:"Será calculado ao processar",link:null};
   const image=p.imagem?`<img class="post-image" src="${esc(p.imagem)}" alt="${esc(p.titulo)}" onerror="this.style.display='none'">`:`<div class="post-image-placeholder">Imagem não identificada</div>`;
   const link=p.link?`<a class="download-preview" href="${esc(p.link)}" target="_blank" rel="noopener">DOWNLOAD</a>`:`<div class="download-preview disabled">DOWNLOAD</div>`;
-  $("resourcePostPreview").innerHTML=`<div class="post-preview"><div class="post-format-title">Formato de Publicação</div><div class="post-example">Exemplo para seguir:</div><div class="post-label">Imagem:</div>${image}<div class="post-label">Informações:</div><div class="post-info"><p><b>Descrição:</b> ${esc(p.descricao)}</p><p><b>Autor:</b> ${esc(p.autor)}</p><p><b>Comandos:</b> ${esc(p.comandos)}</p><p><b>Categoria:</b> ${esc(p.categoria)}</p><p><b>Peso:</b> ${esc(p.peso)}</p>${p.versao?`<p><b>Versão:</b> ${esc(p.versao)}</p>`:""}${p.dependencias?`<p><b>Dependências:</b> ${esc(p.dependencias)}</p>`:""}</div><div class="post-label">Link:</div>${link}${p.fonte?`<div class="post-source">Fonte: ${esc(p.fonte)}</div>`:""}</div>`;
+  $("resourcePostPreview").innerHTML=`<div class="post-preview"><div class="post-format-title">Formato de Publicação</div><div class="post-example">Exemplo para seguir:</div><div class="post-label">Imagem:</div>${image}<div class="post-label">Informações:</div><div class="post-info"><p><b>Descrição:</b> ${esc(p.descricao)}</p><p><b>Autor:</b> ${esc(p.autor)}</p><p><b>Comandos:</b> ${esc(p.comandos)}</p><p><b>Categoria:</b> ${esc(p.categoria)}</p><p><b>Peso:</b> ${esc(p.peso)}</p>${p.versao?`<p><b>Versão:</b> ${esc(p.versao)}</p>`:""}${p.dependencias?`<p><b>Dependências:</b> ${esc(p.dependencias)}</p>`:""}</div><div class="post-label">Link:</div>${link}</div>`;
 }
 
 $("approveResource").onclick=()=>$("resourceStatus").textContent="✅ Publicação aprovada. Ela está pronta para a próxima etapa; nada foi publicado automaticamente.";
