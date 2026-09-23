@@ -59,7 +59,7 @@ app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.7.0",
+  ok:true, project:"furia-mods-ia", version:"5.8.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -374,10 +374,56 @@ async function resolveWithBrowser(url){
     }
     const host=new URL(url).hostname.toLowerCase();
 
-    // Aguarda o elemento real do MediaFire aparecer. Ele pode ser inserido
-    // depois do carregamento inicial da página.
+    // MediaFire: primeiro fazemos exatamente o que o usuário faz manualmente
+    // ao segurar o botão e copiar o endereço: lemos o destino do próprio botão.
+    // Isso é mais confiável que esperar um evento de download do navegador.
     if(host.includes("mediafire.com")){
-      await page.locator('#downloadButton').first().waitFor({state:'visible',timeout:15000}).catch(()=>{});
+      await page.waitForTimeout(1200);
+
+      const domCandidates = await page.evaluate(() => {
+        const out=[];
+        const add=(v)=>{ if(typeof v === "string" && v.trim() && !out.includes(v.trim())) out.push(v.trim()); };
+        const button=document.querySelector('#downloadButton');
+        if(button){
+          add(button.getAttribute('href'));
+          add(button.getAttribute('data-scrambled-url'));
+          add(button.getAttribute('data-url'));
+          add(button.getAttribute('data-href'));
+          add(button.getAttribute('download'));
+          add(button.getAttribute('onclick'));
+        }
+        for(const el of document.querySelectorAll('a,button')){
+          const text=(el.innerText||el.textContent||'').trim().toLowerCase();
+          const href=el.getAttribute('href');
+          const dataUrl=el.getAttribute('data-url')||el.getAttribute('data-href')||el.getAttribute('data-scrambled-url');
+          if(text.includes('download') || text.includes('baixar') || el.id==='downloadButton'){
+            add(href); add(dataUrl); add(el.getAttribute('onclick'));
+          }
+        }
+        return out;
+      });
+
+      console.log(`MediaFire navegador: ${domCandidates.length} destino(s) encontrado(s) no botão/DOM.`);
+
+      for(const raw of domCandidates){
+        const decoded=decodeScrambledUrl(raw)||raw;
+        const candidates=[decoded];
+        if(typeof decoded==='string'){
+          const direct=decoded.match(/https?:\/\/download\d*\.mediafire\.com\/[^\s"'<>\)]+/i);
+          if(direct) candidates.push(direct[0]);
+        }
+        for(const candidate of candidates){
+          const normalized=normalizeCandidateUrl(candidate,url);
+          if(!normalized) continue;
+          const probe=await probeArchiveCandidate(normalized);
+          if(probe && probe.magic){
+            console.log(`MediaFire navegador: destino real do botão encontrado em ${probe.downloadUrl}`);
+            return {downloadUrl:probe.downloadUrl,filename:probe.filename||null,type:probe.magic};
+          }
+        }
+      }
+
+      // Se o href não for exposto, tentamos o clique real como último recurso.
       const checkbox=page.locator('input[type="checkbox"]').first();
       if(await checkbox.count() && await checkbox.isVisible().catch(()=>false)) await checkbox.check().catch(()=>{});
       const selectors=[
@@ -402,7 +448,6 @@ async function resolveWithBrowser(url){
         }
       }
       if(!clicked){
-        // Último fallback: procurar qualquer link/botão cujo texto indique download.
         const candidates=page.locator('a,button,input[type="button"],input[type="submit"]');
         const count=await candidates.count();
         for(let i=0;i<Math.min(count,80);i++){
@@ -690,7 +735,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.7.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"5.8.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -703,4 +748,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V5.7 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V5.8 rodando na porta ${PORT}`));
