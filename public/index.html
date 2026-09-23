@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fúria Mods — Catálogo e Analisador</title><link rel="stylesheet" href="/style.css"></head>
 <body><main class="container">
-<header><h1>FÚRIA MODS</h1><p>Catálogo e Analisador de Mods · V6.0</p></header>
+<header><h1>FÚRIA MODS</h1><p>Catálogo e Analisador de Mods · V6.1</p></header>
 
 <section class="card catalog-card">
   <div class="section-head"><div><h2>🆕 Mods mais recentes</h2><p class="hint">Todos os tipos do MTA Resources juntos. Mostrando 5 por vez.</p></div><button id="refreshCatalog" class="secondary">↻ Atualizar</button></div>
@@ -27,18 +27,42 @@ function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&l
 
 function renderCatalog(items,page){
   const box=$("catalog"); box.innerHTML="";
-  items.forEach((item,i)=>{
-    const card=document.createElement("article"); card.className="catalog-item";
-    const image=item.imageUrl?`<img src="${esc(item.imageUrl)}" alt="" loading="lazy" onerror="this.style.display='none'">`:"";
-    card.innerHTML=`${image?`<div class="catalog-image">${image}</div>`:"<div class="catalog-image placeholder">MTA</div>"}
-      <div class="catalog-body"><div class="catalog-top"><span class="badge">${esc(item.category||"Categoria não identificada")}</span>${item.date?`<span class="date">${esc(item.date)}</span>`:""}</div>
-      <h3>${esc(item.title)}</h3><p>${esc(item.description||"Descrição disponível na página do recurso.")}</p>
-      <div class="catalog-actions"><button class="analyze-catalog" data-url="${esc(item.resourceUrl)}">⚙ Processar mod</button><a href="${esc(item.resourceUrl)}" target="_blank" rel="noopener">Ver recurso ↗</a></div></div>`;
+  if(!Array.isArray(items)||!items.length){
+    $("catalogStatus").textContent="Nenhum recurso encontrado nesta página.";
+    return;
+  }
+  items.forEach(item=>{
+    const card=document.createElement("article");
+    card.className="catalog-item";
+
+    const imageWrap=document.createElement("div");
+    imageWrap.className="catalog-image";
+    if(item.imageUrl){
+      const img=document.createElement("img");
+      img.src=item.imageUrl; img.alt=""; img.loading="lazy";
+      img.onerror=()=>{img.remove(); imageWrap.textContent="MTA"; imageWrap.classList.add("placeholder");};
+      imageWrap.appendChild(img);
+    }else{
+      imageWrap.textContent="MTA";
+      imageWrap.classList.add("placeholder");
+    }
+
+    const body=document.createElement("div"); body.className="catalog-body";
+    const top=document.createElement("div"); top.className="catalog-top";
+    const badge=document.createElement("span"); badge.className="badge"; badge.textContent=item.category||"Categoria não identificada";
+    top.appendChild(badge);
+    if(item.date){const date=document.createElement("span"); date.className="date"; date.textContent=item.date; top.appendChild(date);}
+
+    const title=document.createElement("h3"); title.textContent=item.title||"Recurso sem título";
+    const desc=document.createElement("p"); desc.textContent=item.description||"Descrição disponível na página do recurso.";
+    const actions=document.createElement("div"); actions.className="catalog-actions";
+    const process=document.createElement("button"); process.className="analyze-catalog"; process.type="button"; process.textContent="⚙ Processar mod"; process.dataset.url=item.resourceUrl||"";
+    process.onclick=()=>{ $("url").value=process.dataset.url; $("url").scrollIntoView({behavior:"smooth",block:"center"}); };
+    const link=document.createElement("a"); link.href=item.resourceUrl||"#"; link.target="_blank"; link.rel="noopener"; link.textContent="Ver recurso ↗";
+    actions.append(process,link);
+    body.append(top,title,desc,actions);
+    card.append(imageWrap,body);
     box.appendChild(card);
-  });
-  document.querySelectorAll(".analyze-catalog").forEach(btn=>btn.onclick=()=>{
-    $("url").value=btn.dataset.url;
-    $("url").scrollIntoView({behavior:"smooth",block:"center"});
   });
   $("catalogStatus").textContent=`Página ${page} · ${items.length} recurso(s) encontrados. A categoria de cada mod é preservada.`;
 }
@@ -47,13 +71,22 @@ async function loadCatalog(page=1){
   $("catalogStatus").textContent="Buscando os recursos mais recentes...";
   $("catalog").innerHTML="";
   $("nextCatalog").disabled=true; $("refreshCatalog").disabled=true;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),20000);
   try{
-    const r=await fetch(`/api/catalog?page=${page}&limit=5`); const d=await r.json();
+    const r=await fetch(`/api/catalog?page=${page}&limit=5&_=${Date.now()}`,{cache:"no-store",signal:controller.signal});
+    const text=await r.text();
+    let d;
+    try{d=JSON.parse(text);}catch{throw Error("O catálogo retornou uma resposta inválida.");}
     if(!r.ok||!d.ok)throw Error(d.error||"Falha ao carregar catálogo.");
     catalogPage=page; renderCatalog(d.items,d.page);
   }catch(e){
-    $("catalogStatus").innerHTML=`<span class="error-inline">${esc(e.message)}</span>`;
-  }finally{$("nextCatalog").disabled=false;$("refreshCatalog").disabled=false}
+    const message=e.name==="AbortError"?"O catálogo demorou mais de 20 segundos para responder.":(e.message||"Falha ao carregar catálogo.");
+    $("catalogStatus").innerHTML=`<span class="error-inline">${esc(message)}</span>`;
+  }finally{
+    clearTimeout(timer);
+    $("nextCatalog").disabled=false; $("refreshCatalog").disabled=false;
+  }
 }
 
 $("refreshCatalog").onclick=()=>loadCatalog(1);
