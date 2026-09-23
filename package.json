@@ -1,12 +1,12 @@
 {
   "name": "furia-mods-ia",
-  "version": "5.8.0",
+  "version": "5.9.0",
   "description": "Painel de automação do Fúria Mods",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "postinstall": "npx playwright install chromium",
-    "build": "npx playwright install chromium"
+    "postinstall": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium",
+    "build": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium"
   },
   "engines": {
     "node": "22.x"
