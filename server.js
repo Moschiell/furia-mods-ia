@@ -53,6 +53,127 @@ try {
 app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
 
+
+// ===== Catálogo geral MTA Resources =====
+// Esta camada é independente do downloader/analisador V5.9. Ela apenas lê a
+// página "Todos" do MTA Resources e monta um catálogo leve. Nenhum arquivo do
+// mod é baixado aqui.
+const MTA_RESOURCES_BASE = "https://mtaresources.com.br";
+const MTA_RESOURCES_LIST = `${MTA_RESOURCES_BASE}/resources`;
+
+function stripHtml(v=""){
+  return String(v)
+    .replace(/<script[\s\S]*?<\/script>/gi," ")
+    .replace(/<style[\s\S]*?<\/style>/gi," ")
+    .replace(/<[^>]+>/g," ")
+    .replace(/&nbsp;/gi," ").replace(/&amp;/gi,"&").replace(/&quot;/gi,'"')
+    .replace(/&#39;/gi,"'").replace(/&#x2F;/gi,"/").replace(/&#47;/gi,"/")
+    .replace(/\s+/g," ").trim();
+}
+function absoluteUrl(v,base=MTA_RESOURCES_BASE){
+  if(!v)return null;
+  try{return new URL(v,base).toString()}catch{return null}
+}
+function extractMtaResourceLinks(html){
+  const out=[];
+  const seen=new Set();
+  // O site usa URLs /resource/<id>-<slug>. Pegamos todos os links dessa página.
+  const re=/<a\b[^>]*href=["']([^"']*\/resource\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while((m=re.exec(html))){
+    const url=absoluteUrl(m[1]);
+    if(!url || !/mtaresources\.com\.br\/resource\//i.test(url))continue;
+    const clean=url.split("#")[0].split("?")[0];
+    if(seen.has(clean))continue;
+    seen.add(clean);
+    out.push({url:clean,anchorHtml:m[0],anchorText:stripHtml(m[2])});
+  }
+  return out;
+}
+function surroundingBlock(html,index){
+  // Tenta extrair um card/elemento pai sem depender da classe específica do site.
+  const starts=[];
+  for(const tag of ["article","li","section","div"]){
+    const openRe=new RegExp(`<${tag}\\b[^>]*>`,`gi`);
+    let m;
+    while((m=openRe.exec(html))){ if(m.index<index) starts.push({index:m.index,tag}); else break; }
+  }
+  const candidate=starts.sort((a,b)=>b.index-a.index)[0];
+  if(!candidate)return html.slice(Math.max(0,index-2500),Math.min(html.length,index+5000));
+  const openEnd=html.indexOf(">",candidate.index);
+  let depth=1,pos=openEnd+1;
+  const tokenRe=new RegExp(`<\\/?${candidate.tag}\\b[^>]*>`,`gi`); tokenRe.lastIndex=pos;
+  let t;
+  while((t=tokenRe.exec(html))){
+    if(/^<\//.test(t[0]))depth--; else if(!/\/\s*>$/.test(t[0]))depth++;
+    if(depth===0)return html.slice(candidate.index,t.index+t[0].length);
+  }
+  return html.slice(candidate.index,Math.min(html.length,candidate.index+12000));
+}
+function firstAttr(block,patterns){
+  for(const re of patterns){const m=block.match(re);if(m&&m[1])return m[1];}
+  return null;
+}
+function guessCategory(block,resourceUrl){
+  const text=stripHtml(block);
+  const label=firstAttr(block,[
+    /(?:categoria|category|tipo|type)[^>]*>\s*([^<]{2,80})/i,
+    /class=["'][^"']*(?:category|categoria|tag)[^"']*["'][^>]*>\s*([^<]{2,80})/i
+  ]);
+  if(label)return stripHtml(label);
+  // Alguns cards mostram a categoria como texto visível. Não inventamos uma
+  // categoria; apenas tentamos reconhecer as categorias conhecidas do site.
+  const known=["Scripts","Scripters","Mapas","Jogos","Programas","Backups","Skins","Veículos","Huds","Texturas","Source Bots","ENBS MTA"];
+  return known.find(x=>new RegExp(`\\b${x.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\$&")}\\b`,"i").test(text)) || "Não identificada";
+}
+function parseMtaCatalog(html,limit=5){
+  const links=extractMtaResourceLinks(html);
+  const items=[];
+  const seen=new Set();
+  for(const link of links){
+    if(items.length>=limit)break;
+    const idx=html.indexOf(link.anchorHtml);
+    const block=surroundingBlock(html,idx);
+    const titleFromHeading=firstAttr(block,[
+      /<h[1-6][^>]*>\s*([\s\S]*?)\s*<\/h[1-6]>/i,
+      /class=["'][^"']*(?:title|name)[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\//i
+    ]);
+    const title=stripHtml(titleFromHeading||link.anchorText||link.url.split("/").pop().replace(/^\\d+-/,"").replace(/[-_]+/g," "));
+    if(!title || seen.has(link.url))continue;
+    seen.add(link.url);
+    const image=absoluteUrl(firstAttr(block,[
+      /<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/i,
+      /<source[^>]+src=["']([^"']+)["'][^>]*>/i
+    ]));
+    const description=stripHtml(firstAttr(block,[
+      /class=["'][^"']*(?:description|descricao|excerpt|summary)[^"']*["'][^>]*>([\s\S]*?)<\//i
+    ])||"");
+    const date=stripHtml(firstAttr(block,[
+      /(?:data|date|publicad[oa]|created)[^>]*>\s*([^<]{4,80})/i,
+      /(?:\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/
+    ])||"");
+    const category=guessCategory(block,link.url);
+    items.push({id:(link.url.match(/\/resource\/([^/?#]+)/i)||[])[1]||null,title,category,date:date||null,description:description||null,imageUrl:image||null,resourceUrl:link.url});
+  }
+  return items;
+}
+
+app.get("/api/catalog",async(req,res)=>{
+  const limit=Math.min(Math.max(Number(req.query.limit)||5,1),10);
+  const page=Math.max(Number(req.query.page)||1,1);
+  try{
+    const url=`${MTA_RESOURCES_LIST}?page=${page}`;
+    const r=await fetchPage(url);
+    const html=await r.text();
+    const items=parseMtaCatalog(html,limit);
+    if(!items.length)throw new Error("O MTA Resources respondeu, mas não foi possível identificar os recursos na página.");
+    res.json({ok:true,source:"MTA Resources",page,limit,items});
+  }catch(e){
+    console.error("CATALOG_ERROR",e);
+    res.status(502).json({ok:false,error:e.message||"Não foi possível carregar o catálogo do MTA Resources."});
+  }
+});
+
 app.get("/health",(req,res)=>res.json({
   ok:true, project:"furia-mods-ia", version:"5.9.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
