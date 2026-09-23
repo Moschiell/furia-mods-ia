@@ -218,6 +218,50 @@ function extractMtaDownloadCandidates(html,base){
     return score(a)-score(b);
   });
 }
+function visibleHtml(html){
+  return String(html||"")
+    .replace(/<script[\s\S]*?<\/script>/gi," ")
+    .replace(/<style[\s\S]*?<\/style>/gi," ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi," ");
+}
+function extractVisibleField(html,labelPatterns){
+  const src=visibleHtml(html);
+  const labels=labelPatterns.map(escapeRegExp).join("|");
+  const re=new RegExp(`(?:${labels})\\s*:?\\s*(?:<[^>]+>\\s*)?([^<\\n]{2,800})`,`i`);
+  const m=src.match(re);
+  return m&&m[1]?stripHtml(m[1]):null;
+}
+function extractResourceDescription(html,title){
+  const src=visibleHtml(html);
+  const headingRe=/<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>/gi;
+  const headingMatch=src.match(headingRe);
+  if(headingMatch){
+    const idx=src.indexOf(headingMatch[0]);
+    const after=src.slice(idx+headingMatch[0].length);
+    const beforeInfo=after.search(/<h[1-6][^>]*>\s*(?:Informa[cç][oõ]es|Informações)\s*<\/h[1-6]>/i);
+    const segment=(beforeInfo>=0?after.slice(0,beforeInfo):after).slice(0,7000);
+    const text=stripHtml(segment);
+    const cleaned=text.replace(/^Detalhes completos e download seguro do recurso\.?\s*/i,"").trim();
+    if(cleaned && !/^Detalhes completos/i.test(cleaned)) return cleaned;
+  }
+  return null;
+}
+function extractResourceImage(html,title,resourceUrl){
+  const images=[];
+  const re=/<img\\b[^>]*>/gi; let m;
+  while((m=re.exec(html))){
+    const tag=m[0];
+    const src=firstAttr(tag,[/(?:src|data-src)=['"]([^'"]+)['"]/i]);
+    if(!src)continue;
+    const alt=firstAttr(tag,[/alt=['"]([^'"]*)['"]/i])||"";
+    const cls=firstAttr(tag,[/(?:class|id)=['"]([^'"]*)['"]/i])||"";
+    const u=absoluteUrl(src,resourceUrl); if(!u)continue;
+    const score=(title && alt.toLowerCase().includes(title.toLowerCase())?100:0)+(alt?20:0)+(/resource|thumbnail|cover|preview|mod/i.test(cls)?15:0)-(/logo|banner|header|avatar|icon/i.test(`${alt} ${cls}`)?50:0);
+    images.push({u,score});
+  }
+  images.sort((a,b)=>b.score-a.score);
+  return images[0]?.u||null;
+}
 function parseMtaResourcePage(html,resourceUrl){
   const ogTitle=metaContent(html,"og:title");
   const metaDesc=metaContent(html,"description") || metaContent(html,"og:description");
@@ -228,18 +272,55 @@ function parseMtaResourcePage(html,resourceUrl){
   const slug=(new URL(resourceUrl).pathname.split("/").pop()||"").replace(/^\d+-/i,"").replace(/[-_]+/g," ").trim();
   let title=stripHtml(titleRaw||"").replace(/\s*[|–—-]\s*(MTA Resources|Recursos MTA).*$/i,"").trim();
   if(!title || /^(detalhes e download|download|ver recurso|mta resources|recursos mta)$/i.test(title)) title=slug;
-  const image=absoluteUrl(metaContent(html,"og:image") || firstAttr(html,[
-    /<img[^>]+(?:class|id)=["'][^"']*(?:cover|thumbnail|resource|mod)[^"']*["'][^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/i,
-    /<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/i
-  ]),resourceUrl);
-  const description=stripHtml(firstTextByLabel(html,["Descrição","Descricao","Description"]) || metaDesc || "");
-  const author=stripHtml(firstTextByLabel(html,["Autor","Author","Criador","Creator","Desenvolvedor","Developer"]) || "");
-  const commands=stripHtml(firstTextByLabel(html,["Comandos","Commands","Commandos"]) || "");
-  const category=guessCategory(html,resourceUrl);
+  const image=extractResourceImage(html,title,resourceUrl);
+  const description=extractResourceDescription(html,title) || stripHtml(metaDesc||"");
+  const author=extractVisibleField(html,["Autor","Author","Criador","Creator","Desenvolvedor","Developer"]);
+  const commands=extractVisibleField(html,["Comandos","Commands","Commandos"]);
+  const type=extractVisibleField(html,["Tipo","Type"]);
+  const category=type || "Não identificada";
   const downloadCandidates=extractMtaDownloadCandidates(html,resourceUrl);
-  const date=stripHtml(firstTextByLabel(html,["Data","Publicado","Publicada","Data de publicação","Publicado em"]) || "");
-  return {title:title||"Recurso sem título identificado",description:description||null,author:author||null,commands:commands||null,category:category||"Não identificada",date:date||null,imageUrl:image||null,resourceUrl,downloadCandidates};
+  const date=extractVisibleField(html,["Data","Publicado","Publicada","Data de publicação","Publicado em"]);
+  const requiresDiscord=/ENTRAR\s+COM\s+O\s+DISCORD/i.test(stripHtml(visibleHtml(html))) && !downloadCandidates.length;
+  return {title:title||"Recurso sem título identificado",description:description||null,author:author||null,commands:commands||null,category,date:date||null,imageUrl:image||null,resourceUrl,downloadCandidates,requiresDiscord};
 }
+
+async function discoverResourceCandidatesWithBrowser(resourceUrl){
+  const executablePath=await ensurePlaywrightChromium();
+  const browser=await chromium.launch({headless:true,executablePath,args:["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]});
+  try{
+    const context=await browser.newContext({userAgent:"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"});
+    const page=await context.newPage();
+    await page.goto(resourceUrl,{waitUntil:"domcontentloaded",timeout:30000}).catch(()=>{});
+    await page.waitForTimeout(1200);
+    const candidates=await page.evaluate((base)=>{
+      const out=[]; const seen=new Set();
+      const add=(raw,score=0)=>{
+        if(!raw || typeof raw!=="string") return;
+        raw=raw.trim();
+        if(!raw || /^(javascript:|#|mailto:|tel:)/i.test(raw)) return;
+        try{ const u=new URL(raw,base); if(!/^https?:$/i.test(u.protocol)) return; if(/mtaresources\.com\.br\/resource\//i.test(u.href)) return; if(seen.has(u.href)) return; seen.add(u.href); out.push({url:u.href,score}); }catch{}
+      };
+      const els=[...document.querySelectorAll('a,button,[role="button"],input[type="button"],input[type="submit"]')];
+      for(const el of els){
+        const text=(el.innerText||el.textContent||el.value||" ").trim().toLowerCase();
+        const href=el.getAttribute('href');
+        const attrs=['data-url','data-href','data-download','data-link','data-target','data-src','onclick'];
+        let score=0;
+        if(/baixar|download|arquivo|obter|download do arquivo|baixar arquivo/i.test(text)) score+=100;
+        if(/mediafire|sharemods|mega\.nz|drive\.google|mega\.co|pixeldrain|workupload|gofile|dropbox|4shared/i.test(String(href||''))) score+=80;
+        add(href,score);
+        for(const a of attrs) add(el.getAttribute(a),score-5);
+        const html=el.outerHTML||"";
+        for(const m of html.matchAll(/https?:\/\/[^"'<>\\s)]+/gi)) add(m[0],score-10);
+      }
+      for(const m of document.documentElement.outerHTML.matchAll(/https?:\/\/[^"'<>\\s)]+/gi)) add(m[0],/mediafire|sharemods|\.(zip|rar|7z)([?#]|$)/i.test(m[0])?60:5);
+      return out.sort((a,b)=>b.score-a.score).slice(0,30);
+    },resourceUrl);
+    console.log(`MTA navegador: ${candidates.length} candidato(s) encontrados na página renderizada.`);
+    return candidates.map(x=>x.url);
+  } finally { await browser.close().catch(()=>{}); }
+}
+
 app.get("/api/resource",async(req,res)=>{
   const source=String(req.query.url||"").trim();
   if(!source)return res.status(400).json({ok:false,error:"Informe o link da página do recurso."});
@@ -252,7 +333,7 @@ app.get("/api/resource",async(req,res)=>{
 });
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"6.1.0",
+  ok:true, project:"furia-mods-ia", version:"6.4.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -566,6 +647,33 @@ async function resolveWithBrowser(url){
       else throw e;
     }
     const host=new URL(url).hostname.toLowerCase();
+
+    // Para hospedagens não conhecidas, procuramos primeiro links/botões de
+    // download e URLs de hosts de arquivos. Se encontrarmos outro site de
+    // hospedagem, resolveDownload() poderá seguir a cadeia normalmente.
+    if(!host.includes("mediafire.com") && !host.includes("sharemods.com")){
+      await page.waitForTimeout(900);
+      const genericCandidates=await page.evaluate((base)=>{
+        const out=[]; const seen=new Set();
+        const add=(raw,score=0)=>{if(!raw||typeof raw!=="string")return; raw=raw.trim(); try{const u=new URL(raw,base); if(!/^https?:$/i.test(u.protocol)||seen.has(u.href))return; seen.add(u.href); out.push({url:u.href,score});}catch{}};
+        for(const el of document.querySelectorAll('a,button,[role="button"],input[type="button"],input[type="submit"]')){
+          const text=(el.innerText||el.textContent||el.value||"").trim().toLowerCase();
+          const score=/baixar|download|arquivo|obter/i.test(text)?100:0;
+          add(el.getAttribute('href'),score);
+          for(const a of ['data-url','data-href','data-download','data-link','data-target','onclick']) add(el.getAttribute(a),score-5);
+        }
+        for(const m of document.documentElement.outerHTML.matchAll(/https?:\/\/[^"'<>\s)]+/gi)) add(m[0],/\.(zip|rar|7z)([?#]|$)|mediafire|sharemods|mega\.nz|drive\.google|pixeldrain|gofile|workupload|dropbox/i.test(m[0])?80:5);
+        return out.sort((a,b)=>b.score-a.score).map(x=>x.url).slice(0,20);
+      },url);
+      for(const candidate of genericCandidates){
+        if(candidate===url) continue;
+        try{ const probe=await fetchPage(candidate); const ct=probe.headers.get('content-type')||''; const cd=probe.headers.get('content-disposition')||''; const name=dispositionName(cd); const type=archiveType(name,ct,probe.url); if(type) return {downloadUrl:probe.url,filename:name,type}; }catch{}
+      }
+      for(const candidate of genericCandidates){
+        if(candidate===url) continue;
+        try{ return await resolveWithBrowser(candidate); }catch{}
+      }
+    }
 
     // MediaFire: primeiro fazemos exatamente o que o usuário faz manualmente
     // ao segurar o botão e copiar o endereço: lemos o destino do próprio botão.
@@ -928,7 +1036,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"6.1.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"6.4.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -953,9 +1061,22 @@ app.post("/api/process-resource",async(req,res)=>{
     const u=new URL(source);
     if(!/mtaresources\.com\.br$/i.test(u.hostname) || !/\/resource\//i.test(u.pathname)) throw new Error("O link informado não é uma página de recurso do MTA Resources.");
     const page=await fetchPage(source); const resource=parseMtaResourcePage(await page.text(),source);
-    if(!resource.downloadCandidates.length) throw new Error("A página do recurso foi lida, mas nenhum link de download (MediaFire, ShareMods ou arquivo ZIP/RAR/7Z) foi encontrado.");
+    let candidates=[...resource.downloadCandidates];
+    // Alguns links do MTA Resources são inseridos por JavaScript ou só aparecem
+    // depois que a página é renderizada. Nesses casos, usamos Chromium apenas
+    // para descobrir o destino; o downloader V5.9 continua sendo o responsável
+    // por baixar/analisar o arquivo.
+    if(!candidates.length){
+      try { candidates.push(...await discoverResourceCandidatesWithBrowser(source)); }
+      catch(e){ console.warn(`RESOURCE_BROWSER_DISCOVERY_ERROR: ${e.message}`); }
+    }
+    candidates=[...new Set(candidates)].slice(0,20);
+    if(!candidates.length){
+      if(resource.requiresDiscord) throw new Error("O MTA Resources não expôs o destino do download ao servidor. O navegador do usuário pode ter uma sessão/autorização que o Render não possui.");
+      throw new Error("A página do recurso foi lida, mas nenhum destino de download foi encontrado.");
+    }
     let resolved=null,lastError=null;
-    for(const candidate of resource.downloadCandidates.slice(0,8)){try{resolved=await resolveDownload(candidate);if(resolved)break}catch(e){lastError=e;console.warn(`RESOURCE_DOWNLOAD_CANDIDATE_ERROR ${candidate}: ${e.message}`);}}
+    for(const candidate of candidates){try{resolved=await resolveDownload(candidate);if(resolved)break}catch(e){lastError=e;console.warn(`RESOURCE_DOWNLOAD_CANDIDATE_ERROR ${candidate}: ${e.message}`);}}
     if(!resolved)throw new Error(`O link do arquivo foi encontrado na página, mas não foi possível resolvê-lo automaticamente. ${lastError?.message||""}`.trim());
     archive=path.join(os.tmpdir(),`furia-resource-${Date.now()}-${Math.random().toString(16).slice(2)}.archive`);
     let dl;
@@ -963,7 +1084,7 @@ app.post("/api/process-resource",async(req,res)=>{
     const magicType=await detectArchiveTypeByMagicBytes(archive); if(!magicType)throw new Error("O download encontrado na página não é um ZIP, RAR ou 7Z válido.");
     out=path.join(os.tmpdir(),`furia-resource-out-${Date.now()}-${Math.random().toString(16).slice(2)}`); await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out); const fileName=resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod";
-    res.json({ok:true,version:"6.2.0",sourceUrl:source,resource,file:{name:fileName,type:magicType,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes},analysis,preview:buildResourcePreview(resource,analysis,resolved,fileName)});
+    res.json({ok:true,version:"6.4.0",sourceUrl:source,resource,file:{name:fileName,type:magicType,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes},analysis,preview:buildResourcePreview(resource,analysis,resolved,fileName)});
   }catch(e){console.error("PROCESS_RESOURCE_ERROR",e);res.status(400).json({ok:false,error:e.message||"Não foi possível processar o recurso."});}
   finally{if(archive)try{await fsp.rm(archive,{force:true})}catch{}if(out)try{await fsp.rm(out,{recursive:true,force:true})}catch{}}
 });
