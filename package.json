@@ -1,6 +1,6 @@
 {
   "name": "furia-mods-ia",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "description": "Painel de automação do Fúria Mods",
   "main": "server.js",
   "scripts": {

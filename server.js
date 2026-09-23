@@ -138,7 +138,9 @@ function parseMtaCatalog(html,limit=5){
       /<h[1-6][^>]*>\s*([\s\S]*?)\s*<\/h[1-6]>/i,
       /class=["'][^"']*(?:title|name)[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\//i
     ]);
-    const title=stripHtml(titleFromHeading||link.anchorText||link.url.split("/").pop().replace(/^\\d+-/,"").replace(/[-_]+/g," "));
+    let title=stripHtml(titleFromHeading||link.anchorText||"");
+    const slug=(link.url.split("/").pop()||"").replace(/^\\d+-/,"").replace(/[-_]+/g," ").trim();
+    if(!title || /^(detalhes e download|download|ver recurso|saiba mais)$/i.test(title)) title=slug;
     if(!title || seen.has(link.url))continue;
     seen.add(link.url);
     const image=absoluteUrl(firstAttr(block,[
@@ -175,7 +177,7 @@ app.get("/api/catalog",async(req,res)=>{
 });
 
 app.get("/health",(req,res)=>res.json({
-  ok:true, project:"furia-mods-ia", version:"5.9.0",
+  ok:true, project:"furia-mods-ia", version:"6.1.0",
   archiveDetection:["zip","rar","7z"], magicByteValidation:true
 }));
 
@@ -851,7 +853,7 @@ app.post("/api/analyze",async(req,res)=>{
     await fsp.mkdir(out);
     const analysis=await analyzeArchive(archive,out);
 
-    res.json({ok:true,version:"5.9.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
+    res.json({ok:true,version:"6.1.0",sourceUrl:source,downloadUrl:resolved.downloadUrl,file:{
       name:resolved.filename||path.basename(new URL(resolved.downloadUrl).pathname)||"mod",
       type,sizeMB:+(dl.bytes/1024/1024).toFixed(2),bytes:dl.bytes
     },analysis,preview:preview(resolved.filename||"mod",analysis)});
@@ -864,4 +866,4 @@ app.post("/api/analyze",async(req,res)=>{
   }
 });
 
-app.listen(PORT,()=>console.log(`Fúria Mods IA V5.9 rodando na porta ${PORT}`));
+app.listen(PORT,()=>console.log(`Fúria Mods IA V6.1 rodando na porta ${PORT}`));
